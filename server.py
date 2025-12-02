@@ -4,233 +4,255 @@ import json
 import os
 import requests
 from datetime import datetime
-from typing import Dict, List, Any
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
-# ---------------------------
-# КОНСТАНТИ
-# ---------------------------
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# ===================================================
+# CONFIG
+# ===================================================
+BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
+BACKEND_URL = "https://nahadayka-backend.onrender.com"
+WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/?v=2"
 
 DATA_FILE = "deadlines.json"
 CLIENT_SECRETS_FILE = "credentials.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
-app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# ===================================================
+# FILE STORAGE
+# ===================================================
 
-BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
-REDIRECT_URI = "https://nahadayka-backend.onrender.com/api/google_callback"
-
-
-# ---------------------------
-# ФАЙЛОВЕ СХОВИЩЕ
-# ---------------------------
-
-def load_deadlines() -> Dict[str, List[Dict[str, Any]]]:
+def load_deadlines():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
         return {}
 
-
-def save_deadlines(data: Dict[str, List[Dict[str, Any]]]):
+def save_deadlines(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-# ---------------------------
-# API / DEADLINES
-# ---------------------------
+# ===================================================
+# DEADLINES API
+# ===================================================
 
 @app.get("/api/deadlines/<user_id>")
-def get_deadlines(user_id: str):
+def get_deadlines(user_id):
     data = load_deadlines()
     return jsonify(data.get(user_id, []))
 
-
 @app.post("/api/deadlines/<user_id>")
-def add_deadline(user_id: str):
-    body = request.get_json(force=True)
-    title = (body.get("title") or "").strip()
-    date = (body.get("date") or "").strip()
+def add_deadline(user_id):
+    body = request.get_json()
+    title = body.get("title", "").strip()
+    date = body.get("date", "").strip()
 
     if not title or not date:
-        return jsonify({"error": "missing fields"}), 400
+        return jsonify({"error": "title and date required"}), 400
 
     data = load_deadlines()
-    user_list = data.setdefault(user_id, [])
-
+    data.setdefault(user_id, [])
     new_item = {"title": title, "date": date, "last_notified": None}
-    user_list.append(new_item)
-
+    data[user_id].append(new_item)
     save_deadlines(data)
     return jsonify(new_item), 201
 
-
 @app.delete("/api/deadlines/<user_id>")
-def delete_deadline(user_id: str):
-    body = request.get_json(force=True)
-    title = (body.get("title") or "").strip()
+def delete_deadline(user_id):
+    body = request.get_json()
+    title = body.get("title", "").strip()
 
     data = load_deadlines()
-    if user_id not in data:
-        return jsonify({"deleted": 0})
+    if user_id in data:
+        data[user_id] = [d for d in data[user_id] if d["title"] != title]
+        save_deadlines(data)
 
-    before = len(data[user_id])
-    data[user_id] = [d for d in data[user_id] if d["title"] != title]
-    after = len(data[user_id])
+    return jsonify({"status": "ok"})
 
-    save_deadlines(data)
-    return jsonify({"deleted": before - after})
-
-
-# ---------------------------
+# ===================================================
 # GOOGLE LOGIN
-# ---------------------------
+# ===================================================
+
+REDIRECT_URI = f"{BACKEND_URL}/api/google_callback"
 
 @app.get("/api/google_login/<user_id>")
-def google_login(user_id: str):
+def google_login(user_id):
     flow = Flow.from_client_secrets_file(
         CLIENT_SECRETS_FILE,
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
+        redirect_uri=REDIRECT_URI
     )
 
     auth_url, _ = flow.authorization_url(
         access_type="offline",
+        state=user_id,
         include_granted_scopes="true",
-        prompt="consent",
-        state=user_id
+        prompt="consent"
     )
 
     return jsonify({"auth_url": auth_url})
-
-
-# ---------------------------
-# CALLBACK від Google
-# ---------------------------
 
 @app.get("/api/google_callback")
 def google_callback():
     code = request.args.get("code")
     user_id = request.args.get("state")
 
-    if not code or not user_id:
-        return "Missing parameters!", 400
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+    flow.fetch_token(code=code)
+    creds = flow.credentials
 
-    try:
-        flow = Flow.from_client_secrets_file(
-            CLIENT_SECRETS_FILE,
-            scopes=SCOPES,
-            redirect_uri=REDIRECT_URI,
-        )
+    with open(f"token_{user_id}.json", "w") as f:
+        f.write(creds.to_json())
 
-        flow.fetch_token(code=code)
-        creds = flow.credentials
+    imported = import_google_events(user_id, creds)
 
-        # зберігаємо токен
-        token_path = f"token_user_{user_id}.json"
-        with open(token_path, "w") as f:
-            f.write(creds.to_json())
+    requests.get(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        params={
+            "chat_id": user_id,
+            "text": f"Імпортовано подій: {imported}\nМожеш повернутись у застосунок."
+        }
+    )
 
-        imported = import_google_events(user_id, creds)
-
-        # повідомляємо користувача в Telegram
-        requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            params={
-                "chat_id": user_id,
-                "text": f"Імпортовано подій з Google Calendar: {imported}"
-            }
-        )
-
-        return "Готово! Можеш закрити цю вкладку і повернутись у Telegram."
-
-    except Exception as e:
-        print("callback error:", e)
-        return "Помилка Google Callback", 500
-
-
-# ---------------------------
-# РУЧНИЙ SYNC (бот викликає)
-# ---------------------------
+    return "Готово! Можеш закрити вкладку."
 
 @app.post("/api/google_sync/<user_id>")
-def google_sync(user_id: str):
-    token_path = f"token_user_{user_id}.json"
+def google_sync(user_id):
+    token_path = f"token_{user_id}.json"
     if not os.path.exists(token_path):
         return jsonify({"error": "no_token"}), 401
 
-    try:
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-        imported = import_google_events(user_id, creds)
-        return jsonify({"imported": imported})
-    except Exception as e:
-        print("sync error:", e)
-        return jsonify({"error": "sync_failed"}), 500
+    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    imported = import_google_events(user_id, creds)
 
+    return jsonify({"imported": imported})
 
-# ---------------------------
-# ІМПОРТ ПОДІЙ GOOGLE
-# ---------------------------
+# ===================================================
+# IMPORT GOOGLE EVENTS
+# ===================================================
 
-def import_google_events(user_id: str, creds):
+def import_google_events(user_id, creds):
     service = build("calendar", "v3", credentials=creds)
 
     now = datetime.utcnow().isoformat() + "Z"
     events = service.events().list(
         calendarId="primary",
         timeMin=now,
-        singleEvents=True,
-        orderBy="startTime",
         maxResults=50,
+        singleEvents=True,
+        orderBy="startTime"
     ).execute().get("items", [])
 
     data = load_deadlines()
-    user_list = data.setdefault(user_id, [])
+    user_items = data.setdefault(user_id, [])
 
-    def is_dup(title, date):
-        return any(d["title"] == title and d["date"] == date for d in user_list)
+    def exists(title, date):
+        return any(d["title"] == title and d["date"] == date for d in user_items)
 
     count = 0
+
     for ev in events:
         title = ev.get("summary")
         if not title:
             continue
 
         if "dateTime" in ev["start"]:
-            date_str = ev["start"]["dateTime"][:16].replace("T", " ")
+            date = ev["start"]["dateTime"][:16].replace("T", " ")
         else:
-            date_str = ev["start"]["date"]
+            date = ev["start"]["date"]
 
-        if is_dup(title, date_str):
+        if exists(title, date):
             continue
 
-        user_list.append({"title": title, "date": date_str, "last_notified": None})
+        user_items.append({
+            "title": title,
+            "date": date,
+            "last_notified": None
+        })
         count += 1
 
     save_deadlines(data)
     return count
 
+# ===================================================
+# TELEGRAM WEBHOOK HANDLER
+# ===================================================
 
-# ---------------------------
-# HEALTH
-# ---------------------------
+@app.post(f"/webhook/{BOT_TOKEN}")
+def telegram_webhook():
+    update = request.get_json()
 
-@app.get("/api/health")
-def health():
-    return {"status": "ok"}
+    if "message" not in update:
+        return "ok"
 
+    msg = update["message"]
+    user_id = str(msg["from"]["id"])
 
-# ---------------------------
-# RUN (Render запускає тільки Flask!)
-# ---------------------------
+    # /start
+    if "text" in msg and msg["text"] == "/start":
+        requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            params={
+                "chat_id": user_id,
+                "text": "Привіт! Відкрий застосунок 👇",
+                "reply_markup": json.dumps({
+                    "keyboard": [[{
+                        "text": "📱 Відкрити застосунок",
+                        "web_app": {"url": WEBAPP_URL}
+                    }]],
+                    "resize_keyboard": True
+                })
+            }
+        )
+        return "ok"
+
+    # web_app_data
+    if "web_app_data" in msg:
+        payload = json.loads(msg["web_app_data"]["data"])
+
+        if payload.get("action") == "sync":
+            # тригер імпорту
+            requests.post(f"{BACKEND_URL}/api/google_sync/{user_id}")
+            return "ok"
+
+        if payload.get("action") == "delete":
+            title = payload["title"]
+            data = load_deadlines()
+            if user_id in data:
+                data[user_id] = [d for d in data[user_id] if d["title"] != title]
+                save_deadlines(data)
+            return "ok"
+
+        # new deadline
+        title = payload["title"]
+        date = payload["date"]
+        data = load_deadlines()
+        data.setdefault(user_id, []).append({
+            "title": title,
+            "date": date,
+            "last_notified": None
+        })
+        save_deadlines(data)
+
+    return "ok"
+
+# ===================================================
+# START
+# ===================================================
+
+@app.get("/")
+def home():
+    return "Bot running!", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
-
-
