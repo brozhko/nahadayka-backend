@@ -260,8 +260,15 @@ def health():
 
 
 # ---------------------------
-# RUN (локально)
+# RUN (локально/на Render)
 # ---------------------------
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    import threading
+    from bot import main as run_bot   # імпортуємо твою функцію main з bot.py
+
+    # запускаємо бота у фоновому потоці
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # запускаємо Flask API
+    app.run(host="0.0.0.0", port=8000, debug=False)
