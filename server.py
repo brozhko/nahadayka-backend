@@ -5,6 +5,8 @@ import json
 import os
 import requests
 from datetime import datetime
+from typing import Dict, List, Any
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -16,16 +18,15 @@ SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# якщо бекенд один – це ж сам сервіс
-BACKEND_API = "https://nahadayka-backend.onrender.com/api"
 BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
+REDIRECT_URI = "https://nahadayka-backend.onrender.com/api/google_callback"
 
 
 # ---------------------------
-# ФУНКЦІЇ ФАЙЛОВОГО ЗАПИСУ
+# ФАЙЛОВЕ СХОВИЩЕ ДЕДЛАЙНІВ
 # ---------------------------
 
-def load_deadlines():
+def load_deadlines() -> Dict[str, List[Dict[str, Any]]]:
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -34,19 +35,14 @@ def load_deadlines():
         return {}
 
 
-def save_deadlines(data):
+def save_deadlines(data: Dict[str, List[Dict[str, Any]]]) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 # ---------------------------
-# API ДЕДЛАЙНІВ (для фронта та бота)
+# API ДЛЯ ДЕДЛАЙНІВ
 # ---------------------------
-
-@app.get("/api/health")
-def health():
-    return {"status": "ok"}
-
 
 @app.get("/api/deadlines/<user_id>")
 def get_deadlines(user_id: str):
@@ -63,24 +59,15 @@ def add_deadline(user_id: str):
     if not title or not date_str:
         return jsonify({"error": "title and date are required"}), 400
 
-    # проста валідація формату дати
-    try:
-        if len(date_str) == 10:
-            datetime.strptime(date_str, "%Y-%m-%d")
-        else:
-            datetime.strptime(date_str, "%Y-%m-%d %H:%M")
-    except ValueError:
-        return jsonify({"error": "Bad date format. Use YYYY-MM-DD or YYYY-MM-DD HH:MM"}), 400
-
     data = load_deadlines()
-    data.setdefault(user_id, [])
+    user_items = data.setdefault(user_id, [])
 
     new_item = {
         "title": title,
         "date": date_str,
         "last_notified": None,
     }
-    data[user_id].append(new_item)
+    user_items.append(new_item)
     save_deadlines(data)
 
     return jsonify(new_item), 201
@@ -101,35 +88,34 @@ def delete_deadline(user_id: str):
     before = len(data[user_id])
     data[user_id] = [d for d in data[user_id] if d.get("title") != title]
     after = len(data[user_id])
-    save_deadlines(data)
 
+    save_deadlines(data)
     return jsonify({"deleted": before - after})
 
 
 # ---------------------------
-# GOOGLE LOGIN (КЛЮЧОВЕ)
+# GOOGLE LOGIN
 # ---------------------------
 
 @app.get("/api/google_login/<user_id>")
-def google_login(user_id):
+def google_login(user_id: str):
     """
-    Генерує посилання для входу в Google.
-    state=user_id, щоб у callback знати, кому зберігати токен.
+    Генерує URL для авторизації в Google.
+    state = user_id, щоб у callback знати, кому імпортувати.
     """
     flow = Flow.from_client_secrets_file(
         CLIENT_SECRETS_FILE,
         scopes=SCOPES,
-        redirect_uri="https://nahadayka-backend.onrender.com/api/google_callback",
+        redirect_uri=REDIRECT_URI,
     )
 
-    auth_url, state = flow.authorization_url(
-        prompt="consent",
+    auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
+        prompt="consent",
         state=user_id,
     )
 
-    # НІЧОГО не зберігаємо, просто віддаємо URL
     return jsonify({"auth_url": auth_url})
 
 
@@ -140,63 +126,80 @@ def google_login(user_id):
 @app.get("/api/google_callback")
 def google_callback():
     code = request.args.get("code")
-    user_id = request.args.get("state", "unknown_user")
+    user_id = request.args.get("state")
 
-    if not code:
-        return "No code provided", 400
+    if not code or not user_id:
+        return "Authorization failed: missing code or state", 400
 
-    # Створюємо новий Flow і міняємо code на токен
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri="https://nahadayka-backend.onrender.com/api/google_callback",
-    )
+    try:
+        # Створюємо flow ще раз (не потрібно нічого зберігати між запитами)
+        flow = Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE,
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI,
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
 
-    flow.fetch_token(code=code)
-    creds = flow.credentials
+        # Зберігаємо токен користувача (на майбутнє, якщо захочеш re-sync)
+        token_path = f"token_user_{user_id}.json"
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
 
-    # Зберігаємо токен користувача
-    token_path = f"token_user_{user_id}.json"
-    with open(token_path, "w") as f:
-        f.write(creds.to_json())
+        imported = import_google_events(user_id, creds)
 
-    # Імпортуємо події з календаря
-    imported = import_google_events(user_id)
+        # Надсилаємо повідомлення в Telegram
+        try:
+            requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                params={
+                    "chat_id": user_id,
+                    "text": f"Імпортовано подій з Google Calendar: {imported}",
+                },
+                timeout=10,
+            )
+        except Exception as e:
+            print("TG send error:", e)
 
-    # Надсилаємо повідомлення користувачу в Telegram
-    requests.get(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        params={"chat_id": user_id, "text": f"Імпортовано подій: {imported}"},
-    )
+        return "Готово! Події імпортовано, можеш закрити цю вкладку і повернутися в Telegram."
 
-    return "Google авторизація успішна! Можете повернутися до Telegram 👌"
+    except Exception as e:
+        # При будь-якій помилці не валимося 500 для юзера
+        print("google_callback error:", e)
+        return "Сталася помилка під час імпорту з Google Calendar. Спробуй ще раз.", 500
 
 
 # ---------------------------
-# ІМПОРТ GOOGLE CALENDAR
+# ІМПОРТ GOOGLE CALENDAR → deadlines.json
 # ---------------------------
 
-def import_google_events(user_id: str) -> int:
-    token_path = f"token_user_{user_id}.json"
-    if not os.path.exists(token_path):
-        return 0
+def import_google_events(user_id: str, creds: Credentials | None = None) -> int:
+    """
+    Читає події з Google Calendar і додає їх у deadlines.json для цього user_id.
+    НІЯКИХ HTTP-запитів на свій же бекенд – тільки локальний файл.
+    """
+    if creds is None:
+        token_path = f"token_user_{user_id}.json"
+        if not os.path.exists(token_path):
+            return 0
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
-    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
     service = build("calendar", "v3", credentials=creds)
 
     now = datetime.utcnow().isoformat() + "Z"
-    events = (
-        service.events()
-        .list(
-            calendarId="primary",
-            timeMin=now,
-            maxResults=50,
-            singleEvents=True,
-            orderBy="startTime",
-        )
-        .execute()
-        .get("items", [])
-    )
+    events = service.events().list(
+        calendarId="primary",
+        timeMin=now,
+        maxResults=50,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute().get("items", [])
+
+    data = load_deadlines()
+    user_items = data.setdefault(user_id, [])
+
+    def is_duplicate(title: str, date_str: str) -> bool:
+        return any(d["title"] == title and d["date"] == date_str for d in user_items)
 
     count = 0
 
@@ -210,19 +213,32 @@ def import_google_events(user_id: str) -> int:
         else:
             date_raw = ev["start"]["date"]
 
-        requests.post(
-            f"{BACKEND_API}/deadlines/{user_id}",
-            json={"title": title, "date": date_raw},
-            timeout=10,
-        )
+        if is_duplicate(title, date_raw):
+            continue
+
+        user_items.append({
+            "title": title,
+            "date": date_raw,
+            "last_notified": None,
+        })
         count += 1
 
+    save_deadlines(data)
     return count
 
 
 # ---------------------------
-# RUN
+# HEALTHCHECK
+# ---------------------------
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+# ---------------------------
+# RUN (локально)
 # ---------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=8000, debug=True)
