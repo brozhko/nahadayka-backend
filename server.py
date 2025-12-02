@@ -21,7 +21,7 @@ BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
 
 
 # ---------------------------
-# ФУНКЦІЇ ЧИТАННЯ/ЗАПИСУ
+# ФУНКЦІЇ ФАЙЛОВОГО ЗАПИСУ
 # ---------------------------
 
 def load_deadlines():
@@ -37,37 +37,48 @@ def save_deadlines(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+
 # ---------------------------
-# API ДЛЯ БОТА
+# GOOGLE LOGIN (КЛЮЧОВЕ)
 # ---------------------------
 
 @app.get("/api/google_login/<user_id>")
 def google_login(user_id):
-    """Генерує URL для авторизації Google."""
+    """Генерує посилання для входу в Google з state=user_id."""
+
     flow = Flow.from_client_secrets_file(
         CLIENT_SECRETS_FILE,
         scopes=SCOPES,
         redirect_uri="https://nahadayka-backend.onrender.com/api/google_callback"
     )
 
-    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+    auth_url, state = flow.authorization_url(
+        prompt="consent",
+        access_type="offline",
+        include_granted_scopes="true",
+        state=user_id  # ← ПЕРЕДАЄМО КОРИСТУВАЧА
+    )
 
-    # Зберігаємо flow в тимчасовий файл
+    # Зберігаємо Flow
     with open(f"flow_{user_id}.json", "w") as f:
         f.write(flow.to_json())
 
     return jsonify({"auth_url": auth_url})
 
 
+
+# ---------------------------
+# CALLBACK ПІСЛЯ GOOGLE LOGIN
+# ---------------------------
+
 @app.get("/api/google_callback")
 def google_callback():
-    """Отримує код Google, обмінює на токен, зберігає, імпортує календар."""
 
     code = request.args.get("code")
-    user_id = request.args.get("state", "unknown_user")
+    user_id = request.args.get("state")  # ← ОТРИМУЄМО user_id
 
-    if not code:
-        return "No code provided", 400
+    if not code or not user_id:
+        return "Authorization failed", 400
 
     # Відновлюємо Flow
     with open(f"flow_{user_id}.json") as f:
@@ -75,24 +86,25 @@ def google_callback():
 
     flow.redirect_uri = "https://nahadayka-backend.onrender.com/api/google_callback"
 
+    # Отримуємо токени
     flow.fetch_token(code=code)
     creds = flow.credentials
 
-    # Зберігаємо токен для цього користувача
-    token_file = f"token_user_{user_id}.json"
-    with open(token_file, "w") as f:
+    # Зберігаємо токен користувача
+    with open(f"token_user_{user_id}.json", "w") as f:
         f.write(creds.to_json())
 
     # Імпортуємо події
     imported = import_google_events(user_id)
 
-    # Надсилаємо повідомлення користувачу
+    # Відправляємо повідомлення в Telegram
     requests.get(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         params={"chat_id": user_id, "text": f"Імпортовано подій: {imported}"}
     )
 
-    return "Google авторизація успішна! Можете повернутися до Telegram 👌"
+    return "Готово! Google Calendar імпортовано. Можеш повертатися в Telegram."
+
 
 
 # ---------------------------
@@ -100,29 +112,29 @@ def google_callback():
 # ---------------------------
 
 def import_google_events(user_id):
-    """Читає Google Calendar і надсилає на backend дедлайни."""
-    token_file = f"token_user_{user_id}.json"
 
-    if not os.path.exists(token_file):
+    token_path = f"token_user_{user_id}.json"
+
+    if not os.path.exists(token_path):
         return 0
 
-    creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
     service = build("calendar", "v3", credentials=creds)
 
     now = datetime.utcnow().isoformat() + "Z"
     events = service.events().list(
         calendarId="primary",
         timeMin=now,
+        maxResults=50,
         singleEvents=True,
-        orderBy="startTime",
-        maxResults=50
+        orderBy="startTime"
     ).execute().get("items", [])
 
     count = 0
 
     for ev in events:
-        summary = ev.get("summary")
-        if not summary:
+        title = ev.get("summary")
+        if not title:
             continue
 
         if "dateTime" in ev["start"]:
@@ -132,7 +144,7 @@ def import_google_events(user_id):
 
         requests.post(
             f"{BACKEND_API}/deadlines/{user_id}",
-            json={"title": summary, "date": date_raw}
+            json={"title": title, "date": date_raw}
         )
 
         count += 1
@@ -140,8 +152,9 @@ def import_google_events(user_id):
     return count
 
 
+
 # ---------------------------
-# ЗДОРОВ'Я
+# SERVICE
 # ---------------------------
 
 @app.get("/api/health")
@@ -149,8 +162,9 @@ def health():
     return {"status": "ok"}
 
 
+
 # ---------------------------
-# ЗАПУСК
+# RUN
 # ---------------------------
 
 if __name__ == "__main__":
