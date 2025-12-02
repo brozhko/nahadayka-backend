@@ -1,4 +1,3 @@
-# server.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
@@ -132,7 +131,7 @@ def google_callback():
         return "Authorization failed: missing code or state", 400
 
     try:
-        # Створюємо flow ще раз (не потрібно нічого зберігати між запитами)
+        # Створюємо flow ще раз
         flow = Flow.from_client_secrets_file(
             CLIENT_SECRETS_FILE,
             scopes=SCOPES,
@@ -141,7 +140,7 @@ def google_callback():
         flow.fetch_token(code=code)
         creds = flow.credentials
 
-        # Зберігаємо токен користувача (на майбутнє, якщо захочеш re-sync)
+        # Зберігаємо токен користувача (на майбутнє для re-sync)
         token_path = f"token_user_{user_id}.json"
         with open(token_path, "w") as f:
             f.write(creds.to_json())
@@ -164,9 +163,33 @@ def google_callback():
         return "Готово! Події імпортовано, можеш закрити цю вкладку і повернутися в Telegram."
 
     except Exception as e:
-        # При будь-якій помилці не валимося 500 для юзера
         print("google_callback error:", e)
         return "Сталася помилка під час імпорту з Google Calendar. Спробуй ще раз.", 500
+
+
+# ---------------------------
+# РУЧНИЙ SYNC З GOOGLE (коли токен уже є)
+# Викликається ботом по /api/google_sync/<user_id>
+# ---------------------------
+
+@app.post("/api/google_sync/<user_id>")
+def google_sync(user_id: str):
+    """
+    Запускає імпорт подій з Google Calendar у deadlines.json
+    для заданого user_id, якщо вже є збережений токен.
+    """
+    token_path = f"token_user_{user_id}.json"
+    if not os.path.exists(token_path):
+        # Немає токена → користувач ще не логінився в Google
+        return jsonify({"error": "no_token"}), 401
+
+    try:
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        imported = import_google_events(user_id, creds)
+        return jsonify({"imported": imported}), 200
+    except Exception as e:
+        print("google_sync error:", e)
+        return jsonify({"error": "sync_failed"}), 500
 
 
 # ---------------------------
