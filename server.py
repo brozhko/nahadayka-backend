@@ -3,12 +3,14 @@ from flask_cors import CORS
 import json
 import os
 from datetime import datetime
+import base64
 import requests
 
 # Google API imports
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
 # ===================================================
@@ -29,7 +31,10 @@ WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 DATA_FILE = "deadlines.json"
 CLIENT_SECRETS_FILE = "credentials.json"
 
-SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
 REDIRECT_URI = f"{BACKEND_URL}/api/google_callback"
 
 
@@ -54,20 +59,12 @@ def save_deadlines(data):
 # ===================================================
 @app.get("/api/all")
 def all_users():
-    """
-    Повертає весь JSON для reminder.py
-    Формат:
-    {
-        "12345": [...],
-        "67890": [...]
-    }
-    """
     data = load_deadlines()
     return jsonify(data)
 
 
 # ===================================================
-# DEADLINES API (ADD + UPDATE)
+# DEADLINES API
 # ===================================================
 @app.post("/api/deadlines/<user_id>")
 def add_or_update_deadline(user_id):
@@ -75,9 +72,7 @@ def add_or_update_deadline(user_id):
     data = load_deadlines()
     data.setdefault(user_id, [])
 
-    # ===================================================
-    # 🔄 UPDATE last_notified (cron / bot)
-    # ===================================================
+    # update last_notified
     if "last_notified_update" in body and "title" in body:
         title = body["title"]
         new_val = body["last_notified_update"]
@@ -90,9 +85,7 @@ def add_or_update_deadline(user_id):
 
         return jsonify({"error": "not found"}), 404
 
-    # ===================================================
-    # ➕ ADD NEW DEADLINE
-    # ===================================================
+    # new deadline
     title = body.get("title", "").strip()
     date = body.get("date", "").strip()
 
@@ -171,22 +164,28 @@ def google_callback():
     with open(f"token_{user_id}.json", "w") as f:
         f.write(creds.to_json())
 
-    imported = import_google_events(user_id, creds)
+    # Import calendar
+    imported_calendar = import_google_calendar(user_id, creds)
+
+    # Import emails
+    imported_gmail = import_gmail(user_id, creds)
 
     # notify user
+    msg = (
+        f"📅 Календар: імпортовано {imported_calendar} подій\n"
+        f"📧 Gmail: знайдено {imported_gmail} листів із завданнями"
+    )
+
     requests.get(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        params={
-            "chat_id": user_id,
-            "text": f"Імпортовано подій: {imported}\nМожеш повернутись у застосунок."
-        }
+        params={"chat_id": user_id, "text": msg}
     )
 
     return "Готово! Можеш закрити вкладку."
 
 
 # ===================================================
-# GOOGLE SYNC
+# GOOGLE SYNC ENDPOINT
 # ===================================================
 @app.post("/api/google_sync/<user_id>")
 def google_sync(user_id):
@@ -196,16 +195,24 @@ def google_sync(user_id):
         return jsonify({"error": "no_token"}), 401
 
     creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-    imported = import_google_events(user_id, creds)
 
-    return jsonify({"imported": imported})
+    imported_calendar = import_google_calendar(user_id, creds)
+    imported_gmail = import_gmail(user_id, creds)
+
+    return jsonify({
+        "calendar": imported_calendar,
+        "gmail": imported_gmail
+    })
 
 
 # ===================================================
-# IMPORT GOOGLE EVENTS
+# IMPORT EVENTS FROM CALENDAR
 # ===================================================
-def import_google_events(user_id, creds):
-    service = build("calendar", "v3", credentials=creds)
+def import_google_calendar(user_id, creds):
+    try:
+        service = build("calendar", "v3", credentials=creds)
+    except:
+        return 0
 
     now = datetime.utcnow().isoformat() + "Z"
 
@@ -232,12 +239,10 @@ def import_google_events(user_id, creds):
         if not title:
             continue
 
-        # Normalize date
         if "dateTime" in ev["start"]:
-            date_value = ev["start"]["dateTime"]
-            date_value = date_value[:16].replace("T", " ")  # YYYY-MM-DD HH:MM
+            date_value = ev["start"]["dateTime"][:16].replace("T", " ")
         else:
-            date_value = ev["start"]["date"]  # YYYY-MM-DD
+            date_value = ev["start"]["date"]
 
         if exists(title, date_value):
             continue
@@ -255,6 +260,63 @@ def import_google_events(user_id, creds):
 
 
 # ===================================================
+# 📧 IMPORT FROM GMAIL
+# ===================================================
+KEYWORDS = ["лаба", "лаб", "завдання", "звіт", "робота", "КР", "практична"]
+
+def import_gmail(user_id, creds):
+    try:
+        service = build("gmail", "v1", credentials=creds)
+    except HttpError:
+        return 0
+
+    # Пошук листів
+    query = " OR ".join(KEYWORDS)
+    result = service.users().messages().list(
+        userId="me", q=query, maxResults=20
+    ).execute()
+
+    messages = result.get("messages", [])
+
+    data = load_deadlines()
+    user_items = data.setdefault(user_id, [])
+
+    added = 0
+
+    for msg in messages:
+        full = service.users().messages().get(
+            userId="me", id=msg["id"]
+        ).execute()
+
+        headers = full.get("payload", {}).get("headers", [])
+        subject = next(
+            (h["value"] for h in headers if h["name"] == "Subject"), "Без теми"
+        )
+
+        date_header = next(
+            (h["value"] for h in headers if h["name"] == "Date"), None
+        )
+
+        try:
+            date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
+            date_str = date_obj.strftime("%Y-%m-%d")
+        except:
+            continue
+
+        # додати як дедлайн тільки якщо немає
+        if not any(d["title"] == subject for d in user_items):
+            user_items.append({
+                "title": subject,
+                "date": date_str,
+                "last_notified": None
+            })
+            added += 1
+
+    save_deadlines(data)
+    return added
+
+
+# ===================================================
 # ROOT
 # ===================================================
 @app.get("/")
@@ -263,7 +325,7 @@ def home():
 
 
 # ===================================================
-# RUN LOCAL
+# RUN
 # ===================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
