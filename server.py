@@ -50,6 +50,23 @@ def save_deadlines(data):
 
 
 # ===================================================
+# API: RETURN ALL USERS (FOR CRON)
+# ===================================================
+@app.get("/api/all")
+def all_users():
+    """
+    Повертає весь JSON для reminder.py
+    Формат:
+    {
+        "12345": [...],
+        "67890": [...]
+    }
+    """
+    data = load_deadlines()
+    return jsonify(data)
+
+
+# ===================================================
 # DEADLINES API (ADD + UPDATE)
 # ===================================================
 @app.post("/api/deadlines/<user_id>")
@@ -59,7 +76,7 @@ def add_or_update_deadline(user_id):
     data.setdefault(user_id, [])
 
     # ===================================================
-    # 🔄 ОНОВЛЕННЯ last_notified (бот)
+    # 🔄 UPDATE last_notified (cron / bot)
     # ===================================================
     if "last_notified_update" in body and "title" in body:
         title = body["title"]
@@ -74,7 +91,7 @@ def add_or_update_deadline(user_id):
         return jsonify({"error": "not found"}), 404
 
     # ===================================================
-    # ➕ ДОДАВАННЯ НОВОГО ДЕДЛАЙНУ
+    # ➕ ADD NEW DEADLINE
     # ===================================================
     title = body.get("title", "").strip()
     date = body.get("date", "").strip()
