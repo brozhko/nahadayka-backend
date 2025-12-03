@@ -1,7 +1,5 @@
 import json
 import os
-from datetime import datetime
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -10,85 +8,61 @@ DATA_FILE = "deadlines.json"
 app = Flask(__name__)
 CORS(app)
 
+# ============================
+# HELPERS
+# ============================
 
 def load_data():
-    """Читаємо всі дедлайни з файлу."""
     if not os.path.exists(DATA_FILE):
         return {}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except json.JSONDecodeError:
+    except:
         return {}
 
-
-def save_data(data: dict) -> None:
-    """Зберігаємо всі дедлайни у файл."""
+def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+# ============================
+# HEALTH CHECK
+# ============================
 
-@app.route("/api/health", methods=["GET"])
+@app.route("/api/health")
 def health():
-    """Проста перевірка, що бекенд живий."""
     return jsonify({"status": "ok"})
 
+# ============================
+# GET DEADLINES
+# ============================
 
-@app.route("/api/deadlines", methods=["GET"])
-def get_deadlines():
-    """Отримати всі дедлайни для одного користувача."""
-    telegram_id = request.args.get("telegram_id")
-
-    if not telegram_id:
-        return jsonify({"error": "telegram_id is required"}), 400
-
+@app.route("/api/deadlines/<user_id>", methods=["GET"])
+def get_deadlines(user_id):
     data = load_data()
-    user_deadlines = data.get(telegram_id, [])
+    return jsonify(data.get(user_id, []))
 
-    return jsonify({"deadlines": user_deadlines})
-
+# ============================
+# ADD DEADLINE
+# ============================
 
 @app.route("/api/deadlines", methods=["POST"])
 def add_deadline():
-    """
-    Додати новий дедлайн.
-    Очікує JSON:
-    {
-      "telegram_id": "123456",
-      "title": "Лаба з фізики",
-      "due_at": "2025-12-05T14:00:00",
-      "subject": "Фізика"
-    }
-    """
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request.get_json() or {}
 
-    telegram_id = payload.get("telegram_id")
+    user_id = payload.get("user_id")
     title = payload.get("title")
-    due_at = payload.get("due_at")
-    subject = payload.get("subject", "")
+    date = payload.get("date")  # ISO string from JS
 
-    if not telegram_id or not title or not due_at:
-        return (
-            jsonify(
-                {"error": "Fields telegram_id, title and due_at are required"}
-            ),
-            400,
-        )
-
-    # Проста перевірка формату дати
-    try:
-        datetime.fromisoformat(due_at.replace("Z", "+00:00"))
-    except ValueError:
-        return jsonify({"error": "due_at must be ISO datetime string"}), 400
+    if not user_id or not title or not date:
+        return jsonify({"error": "Fields user_id, title, date required"}), 400
 
     data = load_data()
-    user_list = data.setdefault(telegram_id, [])
+    user_list = data.setdefault(user_id, [])
 
     new_item = {
-        "id": len(user_list) + 1,
         "title": title,
-        "due_at": due_at,
-        "subject": subject,
+        "date": date,
     }
 
     user_list.append(new_item)
@@ -96,7 +70,54 @@ def add_deadline():
 
     return jsonify(new_item), 201
 
+# ============================
+# DELETE DEADLINE
+# ============================
+
+@app.route("/api/deadlines/delete", methods=["POST"])
+def delete_deadline():
+    payload = request.get_json() or {}
+
+    user_id = payload.get("user_id")
+    title = payload.get("title")
+    date = payload.get("date")
+
+    if not user_id or not title or not date:
+        return jsonify({"error": "Fields user_id, title, date required"}), 400
+
+    data = load_data()
+
+    if user_id not in data:
+        return jsonify({"status": "not_found"}), 404
+
+    before = len(data[user_id])
+    data[user_id] = [
+        d for d in data[user_id]
+        if not (d["title"] == title and d["date"] == date)
+    ]
+
+    save_data(data)
+
+    return jsonify({"removed": before - len(data[user_id])})
+
+# ============================
+# IMPORT GOOGLE (placeholder)
+# ============================
+
+@app.route("/api/import/google", methods=["POST"])
+def import_google():
+    payload = request.get_json() or {}
+    user_id = payload.get("user_id")
+
+    print("Google import requested by:", user_id)
+
+    # ПОКИ ПРОСТО ПОВЕРТАЄМО SUCCESS
+    # (пізніше додамо API Google Calendar)
+    return jsonify({"status": "ok"})
+
+# ============================
+# START
+# ============================
 
 if __name__ == "__main__":
-    # Локальний запуск
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)
