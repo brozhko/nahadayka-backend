@@ -27,7 +27,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 
 # Токен бота і URL фронту краще задавати через змінні середовища на Render
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg")
 WEBAPP_URL = os.getenv(
     "WEBAPP_URL",
     "https://brozhko.github.io/nahadayka-bot_v1/"  # 🔴 заміни на свій GitHub Pages, якщо інший
@@ -237,3 +237,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     logging.info(f"Запускаю Flask API на 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
+
