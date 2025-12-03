@@ -260,9 +260,12 @@ def import_google_calendar(user_id, creds):
 
 
 # ===================================================
-# 📧 IMPORT FROM GMAIL
+# 📧 IMPORT FROM GMAIL (LPNU + KEYWORDS)
 # ===================================================
+
 KEYWORDS = ["лаба", "лаб", "завдання", "звіт", "робота", "КР", "практична"]
+LPNU_DOMAIN = "@lpnu.ua"
+
 
 def import_gmail(user_id, creds):
     try:
@@ -270,10 +273,18 @@ def import_gmail(user_id, creds):
     except HttpError:
         return 0
 
-    # Пошук листів
+    # Пошук за ключовими словами
     query = " OR ".join(KEYWORDS)
+
+    # Також фільтруємо за доменом викладачів
+    # Gmail дозволяє комбінувати так:
+    # (лаба OR завдання) from:lpnu.ua
+    query = f"({query}) OR from:{LPNU_DOMAIN}"
+
     result = service.users().messages().list(
-        userId="me", q=query, maxResults=20
+        userId="me",
+        q=query,
+        maxResults=30
     ).execute()
 
     messages = result.get("messages", [])
@@ -289,21 +300,43 @@ def import_gmail(user_id, creds):
         ).execute()
 
         headers = full.get("payload", {}).get("headers", [])
+
         subject = next(
-            (h["value"] for h in headers if h["name"] == "Subject"), "Без теми"
+            (h["value"] for h in headers if h["name"] == "Subject"),
+            "Без теми"
+        )
+
+        sender = next(
+            (h["value"] for h in headers if h["name"] == "From"),
+            ""
         )
 
         date_header = next(
-            (h["value"] for h in headers if h["name"] == "Date"), None
+            (h["value"] for h in headers if h["name"] == "Date"),
+            None
         )
 
+        # Парсимо дату
         try:
             date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
             date_str = date_obj.strftime("%Y-%m-%d")
         except:
             continue
 
-        # додати як дедлайн тільки якщо немає
+        # Фільтр: приймаємо якщо:
+        # 1) лист від викладача LPNU
+        # 2) або в темі є ключові слова
+        subject_lower = subject.lower()
+
+        matched = (
+            LPNU_DOMAIN in sender.lower() or
+            any(k in subject_lower for k in KEYWORDS)
+        )
+
+        if not matched:
+            continue
+
+        # Уникнення дублікатів
         if not any(d["title"] == subject for d in user_items):
             user_items.append({
                 "title": subject,
@@ -329,3 +362,4 @@ def home():
 # ===================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
+
