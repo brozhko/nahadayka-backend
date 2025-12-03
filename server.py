@@ -1,243 +1,313 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import json
 import os
-from datetime import datetime
-import requests
+import json
+from typing import Dict, List, Any
+from datetime import datetime, timedelta, timezone
 
-# Google API imports
-from google.oauth2.credentials import Credentials
+from flask import Flask, request, jsonify, redirect, url_for
+from flask_cors import CORS
+
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+from dateutil import parser as date_parser
 
-# ===================================================
-# APP INIT
-# ===================================================
-app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# =====================================
+#  НАЛАШТУВАННЯ
+# =====================================
+APP_PORT = int(os.environ.get("PORT", 5000))
 
-# ===================================================
-# CONFIG
-# ===================================================
-BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
-BACKEND_URL = "https://nahadayka-backend.onrender.com"
-WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
+# Файл з дедлайнами бекенду
+DATA_FILE = "deadlines_backend.json"
 
-DATA_FILE = "deadlines.json"
-CLIENT_SECRETS_FILE = "credentials.json"
+# Файл з токенами Google (user_id -> credentials)
+TOKENS_FILE = "google_tokens.json"
+
+# Шлях до client_secret (credentials.json з Google Cloud)
+GOOGLE_CLIENT_SECRETS_FILE = "credentials.json"
+
+# Ті самі SCOPES, що й у проекті
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
-REDIRECT_URI = f"{BACKEND_URL}/api/google_callback"
+# Базовий URL твого бекенду на Render
+BACKEND_BASE_URL = os.environ.get(
+    "BACKEND_BASE_URL",
+    "https://nahadayka-backend.onrender.com"
+)
 
-# ===================================================
-# FILE STORAGE
-# ===================================================
-def load_deadlines():
+# Redirect URI МАЄ співпадати з тим, що ти вказав у Google Cloud
+REDIRECT_URI = f"{BACKEND_BASE_URL}/api/oauth2callback"
+
+app = Flask(__name__)
+CORS(app)
+
+
+# =====================================
+#  ХЕЛПЕРИ ДЛЯ ФАЙЛІВ
+# =====================================
+def load_data() -> Dict[str, List[Dict[str, Any]]]:
+    if not os.path.exists(DATA_FILE):
+        return {}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
         return {}
 
 
-def save_deadlines(data):
+def save_data(data: Dict[str, List[Dict[str, Any]]]) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ===================================================
-# DEADLINES API
-# ===================================================
-@app.get("/api/deadlines/<user_id>")
-def get_deadlines(user_id):
-    data = load_deadlines()
-    return jsonify(data.get(user_id, []))
+def load_tokens() -> Dict[str, Any]:
+    if not os.path.exists(TOKENS_FILE):
+        return {}
+    try:
+        with open(TOKENS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
-@app.post("/api/deadlines/<user_id>")
-def add_deadline(user_id):
-    body = request.get_json()
-    title = body.get("title", "").strip()
-    date = body.get("date", "").strip()
-
-    if not title or not date:
-        return jsonify({"error": "title and date required"}), 400
-
-    data = load_deadlines()
-    data.setdefault(user_id, [])
-
-    item = {
-        "title": title,
-        "date": date,
-        "last_notified": None
-    }
-
-    data[user_id].append(item)
-    save_deadlines(data)
-
-    return jsonify(item), 201
+def save_tokens(data: Dict[str, Any]) -> None:
+    with open(TOKENS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-@app.delete("/api/deadlines/<user_id>")
-def delete_deadline(user_id):
-    body = request.get_json()
-    title = body.get("title", "").strip()
+# =====================================
+#  DEADLINES API
+#  /api/deadlines/<user_id>
+# =====================================
+@app.route("/api/deadlines/<user_id>", methods=["GET", "POST", "DELETE"])
+def deadlines(user_id: str):
+    data = load_data()
 
-    data = load_deadlines()
+    # ------- GET -------
+    if request.method == "GET":
+        return jsonify(data.get(user_id, [])), 200
 
-    if user_id in data:
-        data[user_id] = [d for d in data[user_id] if d["title"] != title]
-        save_deadlines(data)
+    # ------- JSON body -------
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
 
-    return jsonify({"status": "ok"})
+    # ------- POST: додати дедлайн -------
+    if request.method == "POST":
+        title = (payload.get("title") or "").strip()
+        date = (payload.get("date") or "").strip()
+
+        if not title or not date:
+            return jsonify({"error": "title і date обовʼязкові"}), 400
+
+        user_list = data.setdefault(user_id, [])
+        new_deadline = {
+            "title": title,
+            "date": date,
+            "last_notified": None,
+        }
+        user_list.append(new_deadline)
+        save_data(data)
+        return jsonify(new_deadline), 201
+
+    # ------- DELETE: видалити по title -------
+    if request.method == "DELETE":
+        title = (payload.get("title") or "").strip()
+        if not title:
+            return jsonify({"error": "title обовʼязковий для видалення"}), 400
+
+        user_list = data.get(user_id, [])
+        new_list = [d for d in user_list if d.get("title") != title]
+
+        if len(new_list) == len(user_list):
+            return jsonify({"error": "Дедлайн з таким title не знайдено"}), 404
+
+        data[user_id] = new_list
+        save_data(data)
+        return jsonify({"status": "ok", "deleted_title": title}), 200
 
 
-# ===================================================
-# GOOGLE LOGIN
-# ===================================================
-@app.get("/api/google_login/<user_id>")
-def google_login(user_id):
+# =====================================
+#  GOOGLE LOGIN (ОТРИМАТИ auth_url)
+#  /api/google_login/<user_id>
+# =====================================
+@app.route("/api/google_login/<user_id>", methods=["GET"])
+def google_login(user_id: str):
     """
-    Повертає URL для авторизації Google.
+    Викликається ботом, коли WebApp надсилає action = "sync".
+    Повертаємо auth_url, де користувач залогіниться через Google.
     """
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
+        GOOGLE_CLIENT_SECRETS_FILE,
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI
+        redirect_uri=REDIRECT_URI,
     )
 
-    auth_url, _ = flow.authorization_url(
+    auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
+        # передамо telegram user_id у state, щоб в callback знати, кому зберігати токен
+        state=user_id,
         prompt="consent",
-        state=user_id
     )
 
-    return jsonify({"auth_url": auth_url})
+    return jsonify({"auth_url": auth_url}), 200
 
 
-# ===================================================
-# GOOGLE CALLBACK
-# ===================================================
-@app.get("/api/google_callback")
-def google_callback():
+# =====================================
+#  OAUTH2 CALLBACK
+#  /api/oauth2callback
+# =====================================
+@app.route("/api/oauth2callback")
+def oauth2callback():
     """
-    Приймає код від Google, зберігає токен користувача.
+    Сюди повертає Google після логіну.
+    Тут міняємо code -> tokens, зберігаємо їх і робимо імпорт календаря.
     """
-    code = request.args.get("code")
+    # Помилки від Google
+    error = request.args.get("error")
+    if error:
+        return f"Google OAuth error: {error}", 400
+
+    # У state ми передавали telegram user_id
     user_id = request.args.get("state")
+    code = request.args.get("code")
 
+    if not user_id or not code:
+        return "Missing state or code parameter", 400
+
+    # Збираємо той самий Flow
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
+        GOOGLE_CLIENT_SECRETS_FILE,
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI
+        redirect_uri=REDIRECT_URI,
     )
 
+    # Обмін коду на токени
     flow.fetch_token(code=code)
     creds = flow.credentials
 
-    # зберегти токен для цього юзера
-    with open(f"token_{user_id}.json", "w") as f:
-        f.write(creds.to_json())
+    # Зберігаємо credentials у файл TOKENS_FILE (по user_id)
+    tokens = load_tokens()
+    tokens[user_id] = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+    }
+    save_tokens(tokens)
 
-    # імпортуємо події після логіну
-    imported = import_google_events(user_id, creds)
+    # Після успішного логіну — одразу імпортуємо календар
+    imported_count = import_calendar_for_user(user_id)
 
-    # повідомити користувача у Telegram
-    requests.get(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        params={
-            "chat_id": user_id,
-            "text": f"Імпортовано подій: {imported}\nМожеш повернутись у застосунок."
-        }
+    # Проста сторінка, яку побачить користувач
+    return f"""
+    <html>
+      <head><title>Імпорт календаря</title></head>
+      <body style="font-family: sans-serif;">
+        <h2>✅ Імпорт виконано</h2>
+        <p>Імпортовано {imported_count} подій з Google Calendar.</p>
+        <p>Тепер можеш повернутись до Telegram і оновити список дедлайнів у WebApp.</p>
+      </body>
+    </html>
+    """
+
+
+# =====================================
+#  ІМПОРТ КАЛЕНДАРЯ ДЛЯ КОРИСТУВАЧА
+# =====================================
+def import_calendar_for_user(user_id: str) -> int:
+    """
+    Читає збережені Google-токени користувача,
+    тягне події з Calendar і зберігає їх у наші дедлайни.
+    Повертає кількість імпортованих подій.
+    """
+    tokens = load_tokens()
+    cred_data = tokens.get(user_id)
+    if not cred_data:
+        return 0
+
+    creds = Credentials(
+        token=cred_data["token"],
+        refresh_token=cred_data.get("refresh_token"),
+        token_uri=cred_data["token_uri"],
+        client_id=cred_data["client_id"],
+        client_secret=cred_data["client_secret"],
+        scopes=cred_data["scopes"],
     )
 
-    return "Готово! Можеш закрити вкладку."
-
-
-# ===================================================
-# GOOGLE SYNC API
-# ===================================================
-@app.post("/api/google_sync/<user_id>")
-def google_sync(user_id):
-    """
-    Запускає імпорт календаря БЕЗ повторної авторизації.
-    """
-    token_path = f"token_{user_id}.json"
-
-    if not os.path.exists(token_path):
-        return jsonify({"error": "no_token"}), 401
-
-    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-
-    imported = import_google_events(user_id, creds)
-    return jsonify({"imported": imported})
-
-
-# ===================================================
-# IMPORT GOOGLE EVENTS LOGIC
-# ===================================================
-def import_google_events(user_id, creds):
-    """
-    Імпорт подій Google Calendar у deadlines.json
-    """
+    # Якщо токен протух — google-auth сам оновить його
     service = build("calendar", "v3", credentials=creds)
 
-    now = datetime.utcnow().isoformat() + "Z"
-    result = service.events().list(
-        calendarId="primary",
-        timeMin=now,
-        maxResults=50,
-        orderBy="startTime",
-        singleEvents=True
-    ).execute()
+    # Часовий діапазон: від зараз до +90 днів
+    now = datetime.now(timezone.utc)
+    time_min = now.isoformat()
+    time_max = (now + timedelta(days=90)).isoformat()
 
-    events = result.get("items", [])
+    events_result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=100,
+        )
+        .execute()
+    )
 
-    data = load_deadlines()
-    user_items = data.setdefault(user_id, [])
+    events = events_result.get("items", [])
 
-    def exists(title, date):
-        return any(d["title"] == title and d["date"] == date for d in user_items)
+    data = load_data()
+    user_list = data.setdefault(user_id, [])
+
+    # Простий захист від дублювання: по (title, date)
+    existing_pairs = {(d["title"], d["date"]) for d in user_list}
 
     imported_count = 0
 
     for ev in events:
-        title = ev.get("summary")
-        if not title:
+        summary = ev.get("summary") or "Без назви події"
+
+        # Дата початку: або date (цілий день), або dateTime
+        start = ev.get("start", {})
+        date_str = start.get("dateTime") or start.get("date")
+        if not date_str:
             continue
 
-        # dateTime або date
-        if "dateTime" in ev["start"]:
-            date = ev["start"]["dateTime"][:16].replace("T", " ")
-        else:
-            date = ev["start"]["date"]
+        # Форматуємо у вигляді "YYYY-MM-DD HH:MM"
+        try:
+            dt = date_parser.parse(date_str)
+            # якщо без часу, буде 00:00
+            formatted = dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            formatted = date_str
 
-        if exists(title, date):
+        key = (summary, formatted)
+        if key in existing_pairs:
             continue
 
-        user_items.append({
-            "title": title,
-            "date": date,
-            "last_notified": None
-        })
-
+        user_list.append(
+            {
+                "title": summary,
+                "date": formatted,
+                "last_notified": None,
+            }
+        )
+        existing_pairs.add(key)
         imported_count += 1
 
-    save_deadlines(data)
+    save_data(data)
     return imported_count
 
 
-# ===================================================
-# ROOT ENDPOINT
-# ===================================================
-@app.get("/")
-def home():
-    return "Backend works!", 200
-
-
-# ===================================================
-# RUN
-# ===================================================
+# =====================================
+#  MAIN
+# =====================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=APP_PORT, debug=True)
