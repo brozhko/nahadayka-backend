@@ -3,7 +3,6 @@ from flask_cors import CORS
 import json
 import os
 from datetime import datetime
-import base64
 import requests
 
 # Google API imports
@@ -59,8 +58,7 @@ def save_deadlines(data):
 # ===================================================
 @app.get("/api/all")
 def all_users():
-    data = load_deadlines()
-    return jsonify(data)
+    return jsonify(load_deadlines())
 
 
 # ===================================================
@@ -85,22 +83,20 @@ def add_or_update_deadline(user_id):
 
         return jsonify({"error": "not found"}), 404
 
-    # new deadline
     title = body.get("title", "").strip()
     date = body.get("date", "").strip()
 
     if not title or not date:
         return jsonify({"error": "title and date required"}), 400
 
-    item = {
+    data[user_id].append({
         "title": title,
         "date": date,
         "last_notified": None
-    }
+    })
 
-    data[user_id].append(item)
     save_deadlines(data)
-    return jsonify(item), 201
+    return jsonify({"status": "added"}), 201
 
 
 @app.get("/api/deadlines/<user_id>")
@@ -128,9 +124,7 @@ def delete_deadline(user_id):
 @app.get("/api/google_login/<user_id>")
 def google_login(user_id):
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
+        CLIENT_SECRETS_FILE, scopes=SCOPES, redirect_uri=REDIRECT_URI,
     )
 
     auth_url, _ = flow.authorization_url(
@@ -152,25 +146,17 @@ def google_callback():
     user_id = request.args.get("state")
 
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
+        CLIENT_SECRETS_FILE, scopes=SCOPES, redirect_uri=REDIRECT_URI,
     )
-
     flow.fetch_token(code=code)
     creds = flow.credentials
 
-    # save token
     with open(f"token_{user_id}.json", "w") as f:
         f.write(creds.to_json())
 
-    # Import calendar
     imported_calendar = import_google_calendar(user_id, creds)
-
-    # Import emails
     imported_gmail = import_gmail(user_id, creds)
 
-    # notify user
     msg = (
         f"📅 Календар: імпортовано {imported_calendar} подій\n"
         f"📧 Gmail: знайдено {imported_gmail} листів із завданнями"
@@ -185,23 +171,19 @@ def google_callback():
 
 
 # ===================================================
-# GOOGLE SYNC ENDPOINT
+# GOOGLE SYNC
 # ===================================================
 @app.post("/api/google_sync/<user_id>")
 def google_sync(user_id):
     token_path = f"token_{user_id}.json"
-
     if not os.path.exists(token_path):
         return jsonify({"error": "no_token"}), 401
 
     creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
-    imported_calendar = import_google_calendar(user_id, creds)
-    imported_gmail = import_gmail(user_id, creds)
-
     return jsonify({
-        "calendar": imported_calendar,
-        "gmail": imported_gmail
+        "calendar": import_google_calendar(user_id, creds),
+        "gmail": import_gmail(user_id, creds)
     })
 
 
@@ -229,9 +211,6 @@ def import_google_calendar(user_id, creds):
     data = load_deadlines()
     user_items = data.setdefault(user_id, [])
 
-    def exists(title, date):
-        return any(d["title"] == title and d["date"] == date for d in user_items)
-
     imported = 0
 
     for ev in events:
@@ -244,7 +223,7 @@ def import_google_calendar(user_id, creds):
         else:
             date_value = ev["start"]["date"]
 
-        if exists(title, date_value):
+        if any(d["title"] == title and d["date"] == date_value for d in user_items):
             continue
 
         user_items.append({
@@ -263,28 +242,23 @@ def import_google_calendar(user_id, creds):
 # 📧 IMPORT FROM GMAIL (LPNU + KEYWORDS)
 # ===================================================
 
-KEYWORDS = ["лаба", "лаб", "завдання", "звіт", "робота", "КР", "практична"]
+KEYWORDS = [k.lower() for k in ["лаба", "лаб", "завдання", "звіт", "робота", "кр", "практична"]]
 LPNU_DOMAIN = "@lpnu.ua"
 
 
 def import_gmail(user_id, creds):
     try:
         service = build("gmail", "v1", credentials=creds)
-    except HttpError:
+    except:
         return 0
 
-    # Пошук за ключовими словами
-    query = " OR ".join(KEYWORDS)
-
-    # Також фільтруємо за доменом викладачів
-    # Gmail дозволяє комбінувати так:
-    # (лаба OR завдання) from:lpnu.ua
-    query = f"({query}) OR from:{LPNU_DOMAIN}"
+    # Gmail НЕ підтримує кирилицю → шукаємо тільки викладачів
+    query = f"from:{LPNU_DOMAIN}"
 
     result = service.users().messages().list(
         userId="me",
         q=query,
-        maxResults=30
+        maxResults=50
     ).execute()
 
     messages = result.get("messages", [])
@@ -295,48 +269,23 @@ def import_gmail(user_id, creds):
     added = 0
 
     for msg in messages:
-        full = service.users().messages().get(
-            userId="me", id=msg["id"]
-        ).execute()
+        full = service.users().messages().get(userId="me", id=msg["id"]).execute()
 
         headers = full.get("payload", {}).get("headers", [])
 
-        subject = next(
-            (h["value"] for h in headers if h["name"] == "Subject"),
-            "Без теми"
-        )
+        subject = next((h["value"] for h in headers if h["name"] == "Subject"), "Без теми")
+        date_header = next((h["value"] for h in headers if h["name"] == "Date"), None)
 
-        sender = next(
-            (h["value"] for h in headers if h["name"] == "From"),
-            ""
-        )
-
-        date_header = next(
-            (h["value"] for h in headers if h["name"] == "Date"),
-            None
-        )
-
-        # Парсимо дату
         try:
             date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
             date_str = date_obj.strftime("%Y-%m-%d")
         except:
             continue
 
-        # Фільтр: приймаємо якщо:
-        # 1) лист від викладача LPNU
-        # 2) або в темі є ключові слова
-        subject_lower = subject.lower()
-
-        matched = (
-            LPNU_DOMAIN in sender.lower() or
-            any(k in subject_lower for k in KEYWORDS)
-        )
-
-        if not matched:
+        # Перевіряємо кирилицю вручну
+        if not any(k in subject.lower() for k in KEYWORDS):
             continue
 
-        # Уникнення дублікатів
         if not any(d["title"] == subject for d in user_items):
             user_items.append({
                 "title": subject,
@@ -362,4 +311,3 @@ def home():
 # ===================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
-
