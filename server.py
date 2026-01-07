@@ -9,7 +9,6 @@ import requests
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 
 # ===================================================
@@ -22,8 +21,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # ===================================================
 # CONFIG
 # ===================================================
-BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
-
+BOT_TOKEN = os.environ.get("8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg", "")  
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 
@@ -71,7 +69,7 @@ def add_or_update_deadline(user_id):
     data.setdefault(user_id, [])
 
     # update last_notified
-    if "last_notified_update" in body and "title" in body:
+    if body and "last_notified_update" in body and "title" in body:
         title = body["title"]
         new_val = body["last_notified_update"]
 
@@ -83,8 +81,8 @@ def add_or_update_deadline(user_id):
 
         return jsonify({"error": "not found"}), 404
 
-    title = body.get("title", "").strip()
-    date = body.get("date", "").strip()
+    title = (body or {}).get("title", "").strip()
+    date = (body or {}).get("date", "").strip()
 
     if not title or not date:
         return jsonify({"error": "title and date required"}), 400
@@ -107,15 +105,16 @@ def get_deadlines(user_id):
 
 @app.delete("/api/deadlines/<user_id>")
 def delete_deadline(user_id):
-    body = request.get_json()
+    body = request.get_json() or {}
     title = body.get("title")
 
     data = load_deadlines()
-    if user_id in data:
+    if user_id in data and title:
         data[user_id] = [d for d in data[user_id] if d["title"] != title]
         save_deadlines(data)
 
     return jsonify({"status": "ok"})
+
 
 # ===================================================
 # 📷 SCAN IMAGE (stub)
@@ -127,9 +126,8 @@ def scan_image():
       - image: файл
       - uid: (optional) user_id
     Повертає:
-      { "items": [ { "title": "...", "date": "YYYY-MM-DD", "time": "HH:MM" }, ... ] }
+      { "items": [ { "title": "...", "date": "YYYY-MM-DD HH:MM" }, ... ] }
     """
-
     if "image" not in request.files:
         return jsonify({"items": [], "error": "no_image"}), 400
 
@@ -139,19 +137,16 @@ def scan_image():
     if not img_bytes:
         return jsonify({"items": [], "error": "empty_file"}), 400
 
-    # uid не обов'язковий, але корисний для логів
     uid = request.form.get("uid") or request.args.get("uid") or "unknown"
     print(f"[scan_image] uid={uid}, filename={file.filename}, bytes={len(img_bytes)}")
 
-    # ✅ ПОКИ ЩО: заглушка, щоб перевірити весь ланцюжок фронт->бек
-    # Потім замінимо на реальне розпізнавання (ШІ або OCR)
     today = datetime.now().strftime("%Y-%m-%d")
-items = [
-    {"title": "Дедлайн з фото (тест 1)", "date": f"{today} 23:59"},
-    {"title": "Дедлайн з фото (тест 2)", "date": f"{today} 18:00"},
-]
-return jsonify({"items": items}), 200
+    items = [
+        {"title": "Дедлайн з фото (тест 1)", "date": f"{today} 23:59"},
+        {"title": "Дедлайн з фото (тест 2)", "date": f"{today} 18:00"},
+    ]
 
+    return jsonify({"items": items}), 200
 
 
 # ===================================================
@@ -160,7 +155,9 @@ return jsonify({"items": items}), 200
 @app.get("/api/google_login/<user_id>")
 def google_login(user_id):
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES, redirect_uri=REDIRECT_URI,
+        CLIENT_SECRETS_FILE,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
     )
 
     auth_url, _ = flow.authorization_url(
@@ -182,7 +179,9 @@ def google_callback():
     user_id = request.args.get("state")
 
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES, redirect_uri=REDIRECT_URI,
+        CLIENT_SECRETS_FILE,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
     )
     flow.fetch_token(code=code)
     creds = flow.credentials
@@ -198,10 +197,12 @@ def google_callback():
         f"📧 Gmail: знайдено {imported_gmail} листів із завданнями"
     )
 
-    requests.get(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        params={"chat_id": user_id, "text": msg}
-    )
+    # ✅ якщо токена нема — не валимо сервер
+    if BOT_TOKEN:
+        requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            params={"chat_id": user_id, "text": msg}
+        )
 
     return "Готово! Можеш закрити вкладку."
 
@@ -254,10 +255,13 @@ def import_google_calendar(user_id, creds):
         if not title:
             continue
 
-        if "dateTime" in ev["start"]:
+        if "dateTime" in ev.get("start", {}):
             date_value = ev["start"]["dateTime"][:16].replace("T", " ")
         else:
-            date_value = ev["start"]["date"]
+            date_value = ev.get("start", {}).get("date")
+
+        if not date_value:
+            continue
 
         if any(d["title"] == title and d["date"] == date_value for d in user_items):
             continue
@@ -277,7 +281,6 @@ def import_google_calendar(user_id, creds):
 # ===================================================
 # 📧 IMPORT FROM GMAIL (LPNU + KEYWORDS)
 # ===================================================
-
 KEYWORDS = [k.lower() for k in ["лаба", "лаб", "завдання", "звіт", "робота", "кр", "практична"]]
 LPNU_DOMAIN = "@lpnu.ua"
 
@@ -288,7 +291,6 @@ def import_gmail(user_id, creds):
     except:
         return 0
 
-    # Gmail НЕ підтримує кирилицю → шукаємо тільки викладачів
     query = f"from:{LPNU_DOMAIN}"
 
     result = service.users().messages().list(
@@ -306,11 +308,12 @@ def import_gmail(user_id, creds):
 
     for msg in messages:
         full = service.users().messages().get(userId="me", id=msg["id"]).execute()
-
         headers = full.get("payload", {}).get("headers", [])
 
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "Без теми")
         date_header = next((h["value"] for h in headers if h["name"] == "Date"), None)
+        if not date_header:
+            continue
 
         try:
             date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
@@ -318,7 +321,6 @@ def import_gmail(user_id, creds):
         except:
             continue
 
-        # Перевіряємо кирилицю вручну
         if not any(k in subject.lower() for k in KEYWORDS):
             continue
 
@@ -347,4 +349,3 @@ def home():
 # ===================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
-
