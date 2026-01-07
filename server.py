@@ -21,7 +21,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # ===================================================
 # CONFIG
 # ===================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg")  
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg")
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 
@@ -42,7 +42,7 @@ def load_deadlines():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {}
 
 
@@ -64,25 +64,25 @@ def all_users():
 # ===================================================
 @app.post("/api/deadlines/<user_id>")
 def add_or_update_deadline(user_id):
-    body = request.get_json()
+    body = request.get_json() or {}
     data = load_deadlines()
     data.setdefault(user_id, [])
 
     # update last_notified
-    if body and "last_notified_update" in body and "title" in body:
-        title = body["title"]
-        new_val = body["last_notified_update"]
+    if "last_notified_update" in body and "title" in body:
+        title = str(body.get("title", "")).strip()
+        new_val = body.get("last_notified_update")
 
         for d in data[user_id]:
-            if d["title"] == title:
+            if d.get("title") == title:
                 d["last_notified"] = new_val
                 save_deadlines(data)
                 return jsonify({"updated": True})
 
         return jsonify({"error": "not found"}), 404
 
-    title = (body or {}).get("title", "").strip()
-    date = (body or {}).get("date", "").strip()
+    title = str(body.get("title", "")).strip()
+    date = str(body.get("date", "")).strip()
 
     if not title or not date:
         return jsonify({"error": "title and date required"}), 400
@@ -106,11 +106,11 @@ def get_deadlines(user_id):
 @app.delete("/api/deadlines/<user_id>")
 def delete_deadline(user_id):
     body = request.get_json() or {}
-    title = body.get("title")
+    title = str(body.get("title", "")).strip()
 
     data = load_deadlines()
     if user_id in data and title:
-        data[user_id] = [d for d in data[user_id] if d["title"] != title]
+        data[user_id] = [d for d in data[user_id] if d.get("title") != title]
         save_deadlines(data)
 
     return jsonify({"status": "ok"})
@@ -140,6 +140,7 @@ def scan_image():
     uid = request.form.get("uid") or request.args.get("uid") or "unknown"
     print(f"[scan_image] uid={uid}, filename={file.filename}, bytes={len(img_bytes)}")
 
+    # Заглушка для тесту: 2 дедлайни "сьогодні"
     today = datetime.now().strftime("%Y-%m-%d")
     items = [
         {"title": "Дедлайн з фото (тест 1)", "date": f"{today} 23:59"},
@@ -147,6 +148,52 @@ def scan_image():
     ]
 
     return jsonify({"items": items}), 200
+
+
+# ===================================================
+# ✅ ADD SCANNED ITEMS (save найдене одразу)
+# ===================================================
+@app.post("/api/add_scanned/<user_id>")
+def add_scanned(user_id):
+    """
+    Body:
+    {
+      "items": [
+        {"title": "...", "date": "YYYY-MM-DD HH:MM"},
+        ...
+      ]
+    }
+    """
+    body = request.get_json() or {}
+    items = body.get("items") or []
+
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "items required", "added": 0}), 400
+
+    data = load_deadlines()
+    data.setdefault(user_id, [])
+
+    added = 0
+    for it in items:
+        title = str((it or {}).get("title", "")).strip()
+        date = str((it or {}).get("date", "")).strip()
+
+        if not title or not date:
+            continue
+
+        exists = any(d.get("title") == title and d.get("date") == date for d in data[user_id])
+        if exists:
+            continue
+
+        data[user_id].append({
+            "title": title,
+            "date": date,
+            "last_notified": None
+        })
+        added += 1
+
+    save_deadlines(data)
+    return jsonify({"status": "ok", "added": added}), 200
 
 
 # ===================================================
@@ -178,11 +225,16 @@ def google_callback():
     code = request.args.get("code")
     user_id = request.args.get("state")
 
+    if not code or not user_id:
+        return "Missing code/state", 400
+
     flow = Flow.from_client_secrets_file(
         CLIENT_SECRETS_FILE,
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
     )
+
+    # ⚠️ invalid_grant часто через редірект/час/код уже використаний
     flow.fetch_token(code=code)
     creds = flow.credentials
 
@@ -197,7 +249,6 @@ def google_callback():
         f"📧 Gmail: знайдено {imported_gmail} листів із завданнями"
     )
 
-    # ✅ якщо токена нема — не валимо сервер
     if BOT_TOKEN:
         requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -230,7 +281,7 @@ def google_sync(user_id):
 def import_google_calendar(user_id, creds):
     try:
         service = build("calendar", "v3", credentials=creds)
-    except:
+    except Exception:
         return 0
 
     now = datetime.utcnow().isoformat() + "Z"
@@ -255,15 +306,16 @@ def import_google_calendar(user_id, creds):
         if not title:
             continue
 
-        if "dateTime" in ev.get("start", {}):
-            date_value = ev["start"]["dateTime"][:16].replace("T", " ")
+        start = ev.get("start", {})
+        if "dateTime" in start:
+            date_value = start["dateTime"][:16].replace("T", " ")
         else:
-            date_value = ev.get("start", {}).get("date")
+            date_value = start.get("date")
 
         if not date_value:
             continue
 
-        if any(d["title"] == title and d["date"] == date_value for d in user_items):
+        if any(d.get("title") == title and d.get("date") == date_value for d in user_items):
             continue
 
         user_items.append({
@@ -271,7 +323,6 @@ def import_google_calendar(user_id, creds):
             "date": date_value,
             "last_notified": None
         })
-
         imported += 1
 
     save_deadlines(data)
@@ -288,7 +339,7 @@ LPNU_DOMAIN = "@lpnu.ua"
 def import_gmail(user_id, creds):
     try:
         service = build("gmail", "v1", credentials=creds)
-    except:
+    except Exception:
         return 0
 
     query = f"from:{LPNU_DOMAIN}"
@@ -318,13 +369,13 @@ def import_gmail(user_id, creds):
         try:
             date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
             date_str = date_obj.strftime("%Y-%m-%d")
-        except:
+        except Exception:
             continue
 
         if not any(k in subject.lower() for k in KEYWORDS):
             continue
 
-        if not any(d["title"] == subject for d in user_items):
+        if not any(d.get("title") == subject for d in user_items):
             user_items.append({
                 "title": subject,
                 "date": date_str,
