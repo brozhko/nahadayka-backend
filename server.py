@@ -117,6 +117,42 @@ def delete_deadline(user_id):
 
     return jsonify({"status": "ok"})
 
+# ===================================================
+# 📷 SCAN IMAGE (stub)
+# ===================================================
+@app.post("/api/scan_image")
+def scan_image():
+    """
+    Приймає фото (multipart/form-data):
+      - image: файл
+      - uid: (optional) user_id
+    Повертає:
+      { "items": [ { "title": "...", "date": "YYYY-MM-DD", "time": "HH:MM" }, ... ] }
+    """
+
+    if "image" not in request.files:
+        return jsonify({"items": [], "error": "no_image"}), 400
+
+    file = request.files["image"]
+    img_bytes = file.read()
+
+    if not img_bytes:
+        return jsonify({"items": [], "error": "empty_file"}), 400
+
+    # uid не обов'язковий, але корисний для логів
+    uid = request.form.get("uid") or request.args.get("uid") or "unknown"
+    print(f"[scan_image] uid={uid}, filename={file.filename}, bytes={len(img_bytes)}")
+
+    # ✅ ПОКИ ЩО: заглушка, щоб перевірити весь ланцюжок фронт->бек
+    # Потім замінимо на реальне розпізнавання (ШІ або OCR)
+    today = datetime.now().strftime("%Y-%m-%d")
+items = [
+    {"title": "Дедлайн з фото (тест 1)", "date": f"{today} 23:59"},
+    {"title": "Дедлайн з фото (тест 2)", "date": f"{today} 18:00"},
+]
+return jsonify({"items": items}), 200
+
+
 
 # ===================================================
 # GOOGLE LOGIN
@@ -311,3 +347,4 @@ def home():
 # ===================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
+
