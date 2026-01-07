@@ -21,7 +21,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # ===================================================
 # CONFIG
 # ===================================================
-BOT_TOKEN = os.environ.get("8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg", "")  
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg")  
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 
