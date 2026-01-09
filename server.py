@@ -34,7 +34,10 @@ UA_TZ = tz.gettz("Europe/Kyiv")
 # ===================================================
 BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
 
+# ⚠️ Якщо Google OAuth потрібен саме на docker-сервісі,
+# зміни на https://nahadayka-backend-1.onrender.com і додай redirect URI у Google Console.
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
+
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 
 DATA_FILE = "deadlines.json"
@@ -160,7 +163,7 @@ def _ocr_text_from_bytes(img_bytes: bytes) -> str:
     img = _preprocess_image(img)
 
     config = "--oem 1 --psm 6"
-    # ВАЖЛИВО: якщо укр не встановлений, буде помилка — це побачимо в logs/detail
+    # Якщо ukr не встановлений — буде помилка (але в тебе OCR health ок, значить все є)
     text = pytesseract.image_to_string(img, lang="ukr+eng", config=config)
     return text or ""
 
@@ -177,7 +180,7 @@ def _split_lines(text: str) -> list[str]:
 def _parse_dt(candidate: str):
     return dateparser.parse(
         candidate,
-        languages=["uk", "en"],
+        languages=["uk", "ru", "en"],  # ✅ додали ru
         settings={
             "TIMEZONE": "Europe/Kyiv",
             "RETURN_AS_TIMEZONE_AWARE": True,
@@ -186,7 +189,22 @@ def _parse_dt(candidate: str):
     )
 
 
+UA_MONTHS = r"(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)"
+RU_MONTHS = r"(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+
+
 def _extract_datetime_from_line(line: str):
+    """
+    Повертає (date_str 'YYYY-MM-DD HH:MM', title)
+
+    Підтримує:
+      - 12.01.2026 14:30
+      - 12/01 14:30
+      - 2026-01-12 14:30
+      - "сьогодні 18:00", "завтра 9:00"
+      - "21 січня 2026", "21 січня"
+      - "21 января 2026"
+    """
     candidates = []
 
     # dd.mm(.yyyy) [hh:mm]
@@ -198,6 +216,17 @@ def _extract_datetime_from_line(line: str):
     candidates += re.findall(
         r"\b\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?\b",
         line
+    )
+
+    # 21 січня 2026 (укр) + optional time
+    candidates += re.findall(
+        rf"\b\d{{1,2}}\s+{UA_MONTHS}(?:\s+\d{{4}})?(?:\s+\d{{1,2}}:\d{{2}})?\b",
+        line.lower()
+    )
+    # 21 января 2026 (рус) + optional time
+    candidates += re.findall(
+        rf"\b\d{{1,2}}\s+{RU_MONTHS}(?:\s+\d{{4}})?(?:\s+\d{{1,2}}:\d{{2}})?\b",
+        line.lower()
     )
 
     lowered = line.lower()
@@ -216,9 +245,9 @@ def _extract_datetime_from_line(line: str):
             used = c
             break
 
-    # Якщо є тільки час — вважай "сьогодні", або "завтра" якщо час уже минув
+    # Якщо є тільки час — "сьогодні/завтра"
     if not dt and time_only:
-        parsed_time = dateparser.parse(time_only[0], languages=["uk", "en"])
+        parsed_time = dateparser.parse(time_only[0], languages=["uk", "ru", "en"])
         if parsed_time:
             now = datetime.now(UA_TZ)
             dt_candidate = now.replace(
@@ -235,11 +264,16 @@ def _extract_datetime_from_line(line: str):
     if not dt:
         return None, None
 
+    # Якщо в рядку немає часу — ставимо 23:59
+    if not re.search(r"\b\d{1,2}:\d{2}\b", line):
+        dt = dt.replace(hour=23, minute=59, second=0, microsecond=0)
+
     date_str = dt.astimezone(UA_TZ).strftime("%Y-%m-%d %H:%M")
 
+    # title = текст без дати
     title = line
     if used and len(used) < len(line):
-        title = line.replace(used, "").strip(" -–—:;,")
+        title = re.sub(re.escape(used), "", title, flags=re.IGNORECASE).strip(" -–—:;,")
     title = title.strip() or "Дедлайн з фото"
 
     return date_str, title
@@ -285,7 +319,6 @@ def scan_image():
     try:
         text = _ocr_text_from_bytes(img_bytes)
     except Exception as e:
-        # лог в Render
         print("[OCR ERROR]", repr(e))
         return jsonify({"items": [], "error": "ocr_failed", "detail": str(e)}), 500
 
@@ -538,6 +571,5 @@ def home():
 # RUN
 # ===================================================
 if __name__ == "__main__":
-    # ✅ Render дає PORT через env, локально буде 8000
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
