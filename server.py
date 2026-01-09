@@ -2,8 +2,16 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
+from io import BytesIO
 import requests
+
+# OCR
+from PIL import Image, ImageOps
+import pytesseract
+import dateparser
+from dateutil import tz
 
 # Google API imports
 from google.oauth2.credentials import Credentials
@@ -17,11 +25,14 @@ from googleapiclient.discovery import build
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+UA_TZ = tz.gettz("Europe/Kyiv")
+
 
 # ===================================================
 # CONFIG
 # ===================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg")
+BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
+
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 
@@ -117,17 +128,125 @@ def delete_deadline(user_id):
 
 
 # ===================================================
-# 📷 SCAN IMAGE (stub)
+# OCR HELPERS
+# ===================================================
+def _preprocess_image(img: Image.Image) -> Image.Image:
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img)
+    return img
+
+
+def _ocr_text_from_bytes(img_bytes: bytes) -> str:
+    img = Image.open(BytesIO(img_bytes))
+    img = _preprocess_image(img)
+    config = "--oem 1 --psm 6"
+    text = pytesseract.image_to_string(img, lang="ukr+eng", config=config)
+    return text or ""
+
+
+def _split_lines(text: str) -> list[str]:
+    lines = []
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if len(line) >= 3:
+            lines.append(line)
+    return lines
+
+
+def _parse_dt(candidate: str):
+    return dateparser.parse(
+        candidate,
+        languages=["uk", "en"],
+        settings={
+            "TIMEZONE": "Europe/Kyiv",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "PREFER_DATES_FROM": "future",
+        }
+    )
+
+
+def _extract_datetime_from_line(line: str):
+    candidates = []
+
+    candidates += re.findall(
+        r"\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?(?:\s+\d{1,2}:\d{2})?\b",
+        line
+    )
+    candidates += re.findall(
+        r"\b\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?\b",
+        line
+    )
+
+    lowered = line.lower()
+    if any(w in lowered for w in ["сьогодні", "завтра", "післязавтра"]):
+        candidates.append(line)
+
+    time_only = re.findall(r"\b\d{1,2}:\d{2}\b", line)
+
+    dt = None
+    used = None
+
+    for c in candidates:
+        parsed = _parse_dt(c)
+        if parsed:
+            dt = parsed
+            used = c
+            break
+
+    if not dt and time_only:
+        parsed_time = dateparser.parse(time_only[0], languages=["uk", "en"])
+        if parsed_time:
+            now = datetime.now(UA_TZ)
+            dt_candidate = now.replace(
+                hour=parsed_time.hour,
+                minute=parsed_time.minute,
+                second=0,
+                microsecond=0
+            )
+            if dt_candidate < now:
+                dt_candidate = dt_candidate + timedelta(days=1)
+            dt = dt_candidate
+            used = time_only[0]
+
+    if not dt:
+        return None, None
+
+    date_str = dt.astimezone(UA_TZ).strftime("%Y-%m-%d %H:%M")
+
+    title = line
+    if used and len(used) < len(line):
+        title = line.replace(used, "").strip(" -–—:;,")
+    title = title.strip() or "Дедлайн з фото"
+
+    return date_str, title
+
+
+def _extract_items_from_text(text: str) -> list[dict]:
+    lines = _split_lines(text)
+    items = []
+    seen = set()
+
+    for line in lines:
+        date_str, title = _extract_datetime_from_line(line)
+        if not date_str:
+            continue
+
+        key = (title.lower(), date_str)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        items.append({"title": title, "date": date_str})
+
+    return items
+
+
+# ===================================================
+# 📷 SCAN IMAGE (REAL OCR)
 # ===================================================
 @app.post("/api/scan_image")
 def scan_image():
-    """
-    Приймає фото (multipart/form-data):
-      - image: файл
-      - uid: (optional) user_id
-    Повертає:
-      { "items": [ { "title": "...", "date": "YYYY-MM-DD HH:MM" }, ... ] }
-    """
     if "image" not in request.files:
         return jsonify({"items": [], "error": "no_image"}), 400
 
@@ -140,30 +259,24 @@ def scan_image():
     uid = request.form.get("uid") or request.args.get("uid") or "unknown"
     print(f"[scan_image] uid={uid}, filename={file.filename}, bytes={len(img_bytes)}")
 
-    # Заглушка для тесту: 2 дедлайни "сьогодні"
-    today = datetime.now().strftime("%Y-%m-%d")
-    items = [
-        {"title": "Дедлайн з фото (тест 1)", "date": f"{today} 23:59"},
-        {"title": "Дедлайн з фото (тест 2)", "date": f"{today} 18:00"},
-    ]
+    try:
+        text = _ocr_text_from_bytes(img_bytes)
+    except Exception as e:
+        return jsonify({"items": [], "error": "ocr_failed", "detail": str(e)}), 500
 
-    return jsonify({"items": items}), 200
+    items = _extract_items_from_text(text)
+
+    return jsonify({
+        "items": items,
+        "raw_text": text[:4000]
+    }), 200
 
 
 # ===================================================
-# ✅ ADD SCANNED ITEMS (save найдене одразу)
+# ✅ ADD SCANNED ITEMS
 # ===================================================
 @app.post("/api/add_scanned/<user_id>")
 def add_scanned(user_id):
-    """
-    Body:
-    {
-      "items": [
-        {"title": "...", "date": "YYYY-MM-DD HH:MM"},
-        ...
-      ]
-    }
-    """
     body = request.get_json() or {}
     items = body.get("items") or []
 
@@ -234,7 +347,6 @@ def google_callback():
         redirect_uri=REDIRECT_URI,
     )
 
-    # ⚠️ invalid_grant часто через редірект/час/код уже використаний
     flow.fetch_token(code=code)
     creds = flow.credentials
 
@@ -252,7 +364,8 @@ def google_callback():
     if BOT_TOKEN:
         requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            params={"chat_id": user_id, "text": msg}
+            params={"chat_id": user_id, "text": msg},
+            timeout=15
         )
 
     return "Готово! Можеш закрити вкладку."
@@ -300,7 +413,6 @@ def import_google_calendar(user_id, creds):
     user_items = data.setdefault(user_id, [])
 
     imported = 0
-
     for ev in events:
         title = ev.get("summary")
         if not title:
@@ -310,7 +422,10 @@ def import_google_calendar(user_id, creds):
         if "dateTime" in start:
             date_value = start["dateTime"][:16].replace("T", " ")
         else:
+            # all-day event
             date_value = start.get("date")
+            if date_value:
+                date_value = f"{date_value} 09:00"
 
         if not date_value:
             continue
@@ -361,21 +476,22 @@ def import_gmail(user_id, creds):
         full = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = full.get("payload", {}).get("headers", [])
 
-        subject = next((h["value"] for h in headers if h["name"] == "Subject"), "Без теми")
-        date_header = next((h["value"] for h in headers if h["name"] == "Date"), None)
+        subject = next((h["value"] for h in headers if h.get("name") == "Subject"), "Без теми")
+        date_header = next((h["value"] for h in headers if h.get("name") == "Date"), None)
         if not date_header:
             continue
 
+        # дата листа -> дедлайн (умовно 23:59 того дня)
         try:
             date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
-            date_str = date_obj.strftime("%Y-%m-%d")
+            date_str = date_obj.strftime("%Y-%m-%d 23:59")
         except Exception:
             continue
 
         if not any(k in subject.lower() for k in KEYWORDS):
             continue
 
-        if not any(d.get("title") == subject for d in user_items):
+        if not any(d.get("title") == subject and d.get("date") == date_str for d in user_items):
             user_items.append({
                 "title": subject,
                 "date": date_str,
