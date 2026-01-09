@@ -34,8 +34,10 @@ UA_TZ = tz.gettz("Europe/Kyiv")
 # ===================================================
 BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
 
-# ⚠️ Якщо Google OAuth потрібен саме на docker-сервісі,
-# зміни на https://nahadayka-backend-1.onrender.com і додай redirect URI у Google Console.
+# ВАЖЛИВО:
+# Якщо Google OAuth має працювати на docker-сервісі (nahadayka-backend-1),
+# то BACKEND_URL має бути https://nahadayka-backend-1.onrender.com
+# і цей Redirect URI треба додати в Google Console.
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
@@ -163,7 +165,7 @@ def _ocr_text_from_bytes(img_bytes: bytes) -> str:
     img = _preprocess_image(img)
 
     config = "--oem 1 --psm 6"
-    # Якщо ukr не встановлений — буде помилка (але в тебе OCR health ок, значить все є)
+    # якщо "ukr" не встановлений — буде помилка
     text = pytesseract.image_to_string(img, lang="ukr+eng", config=config)
     return text or ""
 
@@ -180,7 +182,7 @@ def _split_lines(text: str) -> list[str]:
 def _parse_dt(candidate: str):
     return dateparser.parse(
         candidate,
-        languages=["uk", "ru", "en"],  # ✅ додали ru
+        languages=["uk", "ru", "en"],
         settings={
             "TIMEZONE": "Europe/Kyiv",
             "RETURN_AS_TIMEZONE_AWARE": True,
@@ -191,6 +193,25 @@ def _parse_dt(candidate: str):
 
 UA_MONTHS = r"(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)"
 RU_MONTHS = r"(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+
+UA_MONTH_MAP = {
+    "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
+    "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12
+}
+RU_MONTH_MAP = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
+}
+
+
+def _normalize_ocr_line(line: str) -> str:
+    """
+    Легка нормалізація OCR:
+    - прибрати зайві пробіли
+    - замінити схожі символи (опціонально)
+    """
+    s = re.sub(r"\s+", " ", line).strip()
+    return s
 
 
 def _extract_datetime_from_line(line: str):
@@ -204,7 +225,42 @@ def _extract_datetime_from_line(line: str):
       - "сьогодні 18:00", "завтра 9:00"
       - "21 січня 2026", "21 січня"
       - "21 января 2026"
+      - "18:00" (тільки час) -> сьогодні/завтра
     """
+    line = _normalize_ocr_line(line)
+    low = line.lower()
+
+    # ===================================================
+    # 1) HARD PARSE для "21 січня 2026" / "21 января 2026"
+    # (щоб dateparser не фантазував типу 2027-01-09)
+    # ===================================================
+    m = re.search(
+        rf"\b(\d{{1,2}})\s+({UA_MONTHS}|{RU_MONTHS})(?:\s+(\d{{4}}))?(?:\s+(\d{{1,2}}):(\d{{2}}))?\b",
+        low
+    )
+    if m:
+        day = int(m.group(1))
+        month_name = m.group(2)
+        year = int(m.group(3)) if m.group(3) else datetime.now(UA_TZ).year
+        hh = int(m.group(4)) if m.group(4) else 23
+        mm = int(m.group(5)) if m.group(5) else 59
+
+        month = UA_MONTH_MAP.get(month_name) or RU_MONTH_MAP.get(month_name)
+        if month:
+            try:
+                dt = datetime(year, month, day, hh, mm, tzinfo=UA_TZ)
+                date_str = dt.strftime("%Y-%m-%d %H:%M")
+
+                used = m.group(0)
+                title = re.sub(re.escape(used), "", line, flags=re.IGNORECASE).strip(" -–—:;,")
+                title = title.strip() or "Дедлайн з фото"
+                return date_str, title
+            except Exception:
+                pass
+
+    # ===================================================
+    # 2) Регекси-кандидати (цифрові формати)
+    # ===================================================
     candidates = []
 
     # dd.mm(.yyyy) [hh:mm]
@@ -218,19 +274,8 @@ def _extract_datetime_from_line(line: str):
         line
     )
 
-    # 21 січня 2026 (укр) + optional time
-    candidates += re.findall(
-        rf"\b\d{{1,2}}\s+{UA_MONTHS}(?:\s+\d{{4}})?(?:\s+\d{{1,2}}:\d{{2}})?\b",
-        line.lower()
-    )
-    # 21 января 2026 (рус) + optional time
-    candidates += re.findall(
-        rf"\b\d{{1,2}}\s+{RU_MONTHS}(?:\s+\d{{4}})?(?:\s+\d{{1,2}}:\d{{2}})?\b",
-        line.lower()
-    )
-
-    lowered = line.lower()
-    if any(w in lowered for w in ["сьогодні", "завтра", "післязавтра"]):
+    # keyword-based line
+    if any(w in low for w in ["сьогодні", "завтра", "післязавтра", "сегодня", "завтра", "послезавтра"]):
         candidates.append(line)
 
     time_only = re.findall(r"\b\d{1,2}:\d{2}\b", line)
@@ -245,7 +290,9 @@ def _extract_datetime_from_line(line: str):
             used = c
             break
 
-    # Якщо є тільки час — "сьогодні/завтра"
+    # ===================================================
+    # 3) Якщо тільки час — вважай сьогодні/завтра
+    # ===================================================
     if not dt and time_only:
         parsed_time = dateparser.parse(time_only[0], languages=["uk", "ru", "en"])
         if parsed_time:
@@ -264,13 +311,12 @@ def _extract_datetime_from_line(line: str):
     if not dt:
         return None, None
 
-    # Якщо в рядку немає часу — ставимо 23:59
+    # Якщо часу немає — ставимо 23:59
     if not re.search(r"\b\d{1,2}:\d{2}\b", line):
         dt = dt.replace(hour=23, minute=59, second=0, microsecond=0)
 
     date_str = dt.astimezone(UA_TZ).strftime("%Y-%m-%d %H:%M")
 
-    # title = текст без дати
     title = line
     if used and len(used) < len(line):
         title = re.sub(re.escape(used), "", title, flags=re.IGNORECASE).strip(" -–—:;,")
