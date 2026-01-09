@@ -155,7 +155,7 @@ def ocr_health():
 def _preprocess_image(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img)
     img = img.convert("L")
-    img.thumbnail((1600, 1600))  # ✅ щоб не з'їдало RAM на великих фото
+    img.thumbnail((1600, 1600))  # щоб не з'їдало RAM
     img = ImageOps.autocontrast(img)
     return img
 
@@ -165,6 +165,7 @@ def _ocr_text_from_bytes(img_bytes: bytes) -> str:
     img = _preprocess_image(img)
 
     config = "--oem 1 --psm 6"
+    # якщо "ukr" не встановлений — буде помилка, але в тебе ocr_health ок
     text = pytesseract.image_to_string(img, lang="ukr+eng", config=config)
     return text or ""
 
@@ -176,19 +177,6 @@ def _split_lines(text: str) -> list[str]:
         if len(line) >= 3:
             lines.append(line)
     return lines
-
-
-UA_MONTHS = r"(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)"
-RU_MONTHS = r"(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
-
-UA_MONTH_MAP = {
-    "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
-    "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12
-}
-RU_MONTH_MAP = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
-    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
-}
 
 
 def _normalize_ocr_line(line: str) -> str:
@@ -207,38 +195,54 @@ def _parse_dt(candidate: str):
     )
 
 
+# ⚠️ ФІКС: робимо non-capturing (?:...), щоб групи regex не ламались
+UA_MONTHS = r"(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)"
+RU_MONTHS = r"(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+
+UA_MONTH_MAP = {
+    "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
+    "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12
+}
+RU_MONTH_MAP = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
+}
+
+
 def _extract_datetime_from_line(line: str):
     """
     Повертає (date_str 'YYYY-MM-DD HH:MM', title)
+
+    Підтримує:
+      - 12.01.2026 14:30
+      - 12/01 14:30
+      - 2026-01-12 14:30
+      - "сьогодні 18:00", "завтра 9:00"
+      - "21 січня 2026", "21 січня"
+      - "21 января 2026"
+      - "18:00" (тільки час) -> сьогодні/завтра
     """
     line = _normalize_ocr_line(line)
     low = line.lower()
 
     # ===================================================
     # 1) HARD PARSE: "21 січня 2026" / "21 января 2026"
+    # ✅ стабільні групи: (day) (month) (year?) (hh?) (mm?)
     # ===================================================
     m = re.search(
         rf"\b(\d{{1,2}})\s+({UA_MONTHS}|{RU_MONTHS})(?:\s+(\d{{4}}))?(?:\s+(\d{{1,2}}):(\d{{2}}))?\b",
         low
     )
     if m:
-        day = int(m.group(1))
+        try:
+            day = int(m.group(1))
+            month_name = m.group(2)  # ✅ тут тільки назва місяця
+            year = int(m.group(3)) if m.group(3) else datetime.now(UA_TZ).year
+            hh = int(m.group(4)) if m.group(4) else 23
+            mm = int(m.group(5)) if m.group(5) else 59
 
-        # ⚠️ ТУТ КЛЮЧОВЕ: місяць ми беремо як останнє слово з group(2)
-        # бо group(2) може містити підгрупи через (UA_MONTHS|RU_MONTHS)
-        month_name = m.group(2).split()[-1].strip()
-
-        year_str = m.group(3)
-        year = int(year_str) if year_str else datetime.now(UA_TZ).year
-
-        hh_str = m.group(4)
-        mm_str = m.group(5)
-        hh = int(hh_str) if hh_str else 23
-        mm = int(mm_str) if mm_str else 59
-
-        month = UA_MONTH_MAP.get(month_name) or RU_MONTH_MAP.get(month_name)
-        if month:
-            try:
+            month = UA_MONTH_MAP.get(month_name) or RU_MONTH_MAP.get(month_name)
+            if month:
                 dt = datetime(year, month, day, hh, mm, tzinfo=UA_TZ)
                 date_str = dt.strftime("%Y-%m-%d %H:%M")
 
@@ -246,8 +250,8 @@ def _extract_datetime_from_line(line: str):
                 title = re.sub(re.escape(used), "", line, flags=re.IGNORECASE).strip(" -–—:;,")
                 title = title.strip() or "Дедлайн з фото"
                 return date_str, title
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     # ===================================================
     # 2) DATEPARSER: цифрові формати + слова сьогодні/завтра
