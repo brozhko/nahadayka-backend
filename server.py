@@ -34,10 +34,9 @@ UA_TZ = tz.gettz("Europe/Kyiv")
 # ===================================================
 BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
 
-# ВАЖЛИВО:
 # Якщо Google OAuth має працювати на docker-сервісі (nahadayka-backend-1),
-# то BACKEND_URL має бути https://nahadayka-backend-1.onrender.com
-# і цей Redirect URI треба додати в Google Console.
+# зміни на "https://nahadayka-backend-1.onrender.com"
+# і додай redirect URI в Google Console.
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
@@ -156,6 +155,7 @@ def ocr_health():
 def _preprocess_image(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img)
     img = img.convert("L")
+    img.thumbnail((1600, 1600))  # ✅ щоб не з'їдало RAM на великих фото
     img = ImageOps.autocontrast(img)
     return img
 
@@ -165,7 +165,6 @@ def _ocr_text_from_bytes(img_bytes: bytes) -> str:
     img = _preprocess_image(img)
 
     config = "--oem 1 --psm 6"
-    # якщо "ukr" не встановлений — буде помилка
     text = pytesseract.image_to_string(img, lang="ukr+eng", config=config)
     return text or ""
 
@@ -177,18 +176,6 @@ def _split_lines(text: str) -> list[str]:
         if len(line) >= 3:
             lines.append(line)
     return lines
-
-
-def _parse_dt(candidate: str):
-    return dateparser.parse(
-        candidate,
-        languages=["uk", "ru", "en"],
-        settings={
-            "TIMEZONE": "Europe/Kyiv",
-            "RETURN_AS_TIMEZONE_AWARE": True,
-            "PREFER_DATES_FROM": "future",
-        }
-    )
 
 
 UA_MONTHS = r"(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)"
@@ -205,34 +192,30 @@ RU_MONTH_MAP = {
 
 
 def _normalize_ocr_line(line: str) -> str:
-    """
-    Легка нормалізація OCR:
-    - прибрати зайві пробіли
-    - замінити схожі символи (опціонально)
-    """
-    s = re.sub(r"\s+", " ", line).strip()
-    return s
+    return re.sub(r"\s+", " ", (line or "")).strip()
+
+
+def _parse_dt(candidate: str):
+    return dateparser.parse(
+        candidate,
+        languages=["uk", "ru", "en"],
+        settings={
+            "TIMEZONE": "Europe/Kyiv",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "PREFER_DATES_FROM": "future",
+        }
+    )
 
 
 def _extract_datetime_from_line(line: str):
     """
     Повертає (date_str 'YYYY-MM-DD HH:MM', title)
-
-    Підтримує:
-      - 12.01.2026 14:30
-      - 12/01 14:30
-      - 2026-01-12 14:30
-      - "сьогодні 18:00", "завтра 9:00"
-      - "21 січня 2026", "21 січня"
-      - "21 января 2026"
-      - "18:00" (тільки час) -> сьогодні/завтра
     """
     line = _normalize_ocr_line(line)
     low = line.lower()
 
     # ===================================================
-    # 1) HARD PARSE для "21 січня 2026" / "21 января 2026"
-    # (щоб dateparser не фантазував типу 2027-01-09)
+    # 1) HARD PARSE: "21 січня 2026" / "21 января 2026"
     # ===================================================
     m = re.search(
         rf"\b(\d{{1,2}})\s+({UA_MONTHS}|{RU_MONTHS})(?:\s+(\d{{4}}))?(?:\s+(\d{{1,2}}):(\d{{2}}))?\b",
@@ -240,10 +223,18 @@ def _extract_datetime_from_line(line: str):
     )
     if m:
         day = int(m.group(1))
-        month_name = m.group(2)
-        year = int(m.group(3)) if m.group(3) else datetime.now(UA_TZ).year
-        hh = int(m.group(4)) if m.group(4) else 23
-        mm = int(m.group(5)) if m.group(5) else 59
+
+        # ⚠️ ТУТ КЛЮЧОВЕ: місяць ми беремо як останнє слово з group(2)
+        # бо group(2) може містити підгрупи через (UA_MONTHS|RU_MONTHS)
+        month_name = m.group(2).split()[-1].strip()
+
+        year_str = m.group(3)
+        year = int(year_str) if year_str else datetime.now(UA_TZ).year
+
+        hh_str = m.group(4)
+        mm_str = m.group(5)
+        hh = int(hh_str) if hh_str else 23
+        mm = int(mm_str) if mm_str else 59
 
         month = UA_MONTH_MAP.get(month_name) or RU_MONTH_MAP.get(month_name)
         if month:
@@ -259,26 +250,23 @@ def _extract_datetime_from_line(line: str):
                 pass
 
     # ===================================================
-    # 2) Регекси-кандидати (цифрові формати)
+    # 2) DATEPARSER: цифрові формати + слова сьогодні/завтра
     # ===================================================
     candidates = []
 
-    # dd.mm(.yyyy) [hh:mm]
     candidates += re.findall(
         r"\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?(?:\s+\d{1,2}:\d{2})?\b",
-        line
+        low
     )
-    # yyyy-mm-dd [hh:mm]
     candidates += re.findall(
         r"\b\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?\b",
-        line
+        low
     )
 
-    # keyword-based line
-    if any(w in low for w in ["сьогодні", "завтра", "післязавтра", "сегодня", "завтра", "послезавтра"]):
-        candidates.append(line)
+    if any(w in low for w in ["сьогодні", "завтра", "післязавтра", "сегодня", "послезавтра"]):
+        candidates.append(low)
 
-    time_only = re.findall(r"\b\d{1,2}:\d{2}\b", line)
+    time_only = re.findall(r"\b\d{1,2}:\d{2}\b", low)
 
     dt = None
     used = None
@@ -291,7 +279,7 @@ def _extract_datetime_from_line(line: str):
             break
 
     # ===================================================
-    # 3) Якщо тільки час — вважай сьогодні/завтра
+    # 3) тільки час -> сьогодні/завтра
     # ===================================================
     if not dt and time_only:
         parsed_time = dateparser.parse(time_only[0], languages=["uk", "ru", "en"])
@@ -311,8 +299,8 @@ def _extract_datetime_from_line(line: str):
     if not dt:
         return None, None
 
-    # Якщо часу немає — ставимо 23:59
-    if not re.search(r"\b\d{1,2}:\d{2}\b", line):
+    # якщо часу нема -> 23:59
+    if not re.search(r"\b\d{1,2}:\d{2}\b", low):
         dt = dt.replace(hour=23, minute=59, second=0, microsecond=0)
 
     date_str = dt.astimezone(UA_TZ).strftime("%Y-%m-%d %H:%M")
@@ -574,7 +562,6 @@ def import_gmail(user_id, creds):
     user_items = data.setdefault(user_id, [])
 
     added = 0
-
     for msg in messages:
         full = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = full.get("payload", {}).get("headers", [])
