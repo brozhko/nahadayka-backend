@@ -3,6 +3,7 @@ from flask_cors import CORS
 import json
 import os
 import re
+import shutil
 from datetime import datetime, timedelta
 from io import BytesIO
 import requests
@@ -128,6 +129,23 @@ def delete_deadline(user_id):
 
 
 # ===================================================
+# ✅ OCR HEALTHCHECK
+# ===================================================
+@app.get("/api/ocr_health")
+def ocr_health():
+    info = {
+        "which_tesseract": shutil.which("tesseract"),
+        "tesseract_version": None,
+        "error": None
+    }
+    try:
+        info["tesseract_version"] = str(pytesseract.get_tesseract_version())
+    except Exception as e:
+        info["error"] = str(e)
+    return jsonify(info), 200
+
+
+# ===================================================
 # OCR HELPERS
 # ===================================================
 def _preprocess_image(img: Image.Image) -> Image.Image:
@@ -140,14 +158,16 @@ def _preprocess_image(img: Image.Image) -> Image.Image:
 def _ocr_text_from_bytes(img_bytes: bytes) -> str:
     img = Image.open(BytesIO(img_bytes))
     img = _preprocess_image(img)
+
     config = "--oem 1 --psm 6"
+    # ВАЖЛИВО: якщо укр не встановлений, буде помилка — це побачимо в logs/detail
     text = pytesseract.image_to_string(img, lang="ukr+eng", config=config)
     return text or ""
 
 
 def _split_lines(text: str) -> list[str]:
     lines = []
-    for raw in text.splitlines():
+    for raw in (text or "").splitlines():
         line = re.sub(r"\s+", " ", raw).strip()
         if len(line) >= 3:
             lines.append(line)
@@ -169,10 +189,12 @@ def _parse_dt(candidate: str):
 def _extract_datetime_from_line(line: str):
     candidates = []
 
+    # dd.mm(.yyyy) [hh:mm]
     candidates += re.findall(
         r"\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?(?:\s+\d{1,2}:\d{2})?\b",
         line
     )
+    # yyyy-mm-dd [hh:mm]
     candidates += re.findall(
         r"\b\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?\b",
         line
@@ -194,6 +216,7 @@ def _extract_datetime_from_line(line: str):
             used = c
             break
 
+    # Якщо є тільки час — вважай "сьогодні", або "завтра" якщо час уже минув
     if not dt and time_only:
         parsed_time = dateparser.parse(time_only[0], languages=["uk", "en"])
         if parsed_time:
@@ -262,13 +285,15 @@ def scan_image():
     try:
         text = _ocr_text_from_bytes(img_bytes)
     except Exception as e:
+        # лог в Render
+        print("[OCR ERROR]", repr(e))
         return jsonify({"items": [], "error": "ocr_failed", "detail": str(e)}), 500
 
     items = _extract_items_from_text(text)
 
     return jsonify({
         "items": items,
-        "raw_text": text[:4000]
+        "raw_text": (text or "")[:4000]
     }), 200
 
 
@@ -422,7 +447,6 @@ def import_google_calendar(user_id, creds):
         if "dateTime" in start:
             date_value = start["dateTime"][:16].replace("T", " ")
         else:
-            # all-day event
             date_value = start.get("date")
             if date_value:
                 date_value = f"{date_value} 09:00"
@@ -481,7 +505,6 @@ def import_gmail(user_id, creds):
         if not date_header:
             continue
 
-        # дата листа -> дедлайн (умовно 23:59 того дня)
         try:
             date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
             date_str = date_obj.strftime("%Y-%m-%d 23:59")
@@ -515,4 +538,6 @@ def home():
 # RUN
 # ===================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    # ✅ Render дає PORT через env, локально буде 8000
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
