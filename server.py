@@ -128,6 +128,32 @@ def get_ai_client():
     return OpenAI(api_key=key)
 
 
+def _openai_response_to_json(resp) -> dict:
+    """
+    openai==2.x: resp.output_parsed може НЕ існувати.
+    Беремо resp.output_text (рядок), і парсимо як JSON.
+    """
+    raw = getattr(resp, "output_text", None)
+
+    if not raw:
+        # fallback: витягнути текст з output/content
+        try:
+            parts = []
+            for item in (getattr(resp, "output", None) or []):
+                for c in (getattr(item, "content", None) or []):
+                    t = getattr(c, "text", None)
+                    if t:
+                        parts.append(t)
+            raw = "\n".join(parts)
+        except Exception:
+            raw = ""
+
+    try:
+        return json.loads(raw) if raw else {"deadlines": []}
+    except Exception:
+        return {"deadlines": [], "raw_text": (raw or "")[:2000]}
+
+
 # ===================================================
 # STORAGE
 # ===================================================
@@ -294,7 +320,8 @@ def scan_deadlines_ai():
             text={"format": {"type": "json_object"}},
         )
 
-        payload = resp.output_parsed if isinstance(resp.output_parsed, dict) else {"deadlines": []}
+        # ✅ FIX для openai==2.x: парсимо JSON з output_text
+        payload = _openai_response_to_json(resp)
 
         # 4) save cache (сирий результат)
         cache[img_key] = payload
