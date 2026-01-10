@@ -3,6 +3,7 @@ from flask_cors import CORS
 import json
 import os
 import base64
+import hashlib
 from datetime import datetime
 import requests
 from zoneinfo import ZoneInfo
@@ -44,9 +45,87 @@ REDIRECT_URI = f"{BACKEND_URL}/api/google_callback"
 
 
 # ===================================================
-# OPENAI
+# AI LIMITS + CACHE (anti-balance-eater)
 # ===================================================
-ai = OpenAI()  # OPENAI_API_KEY має бути в Render env
+AI_LIMIT_PER_DAY = int(os.getenv("AI_LIMIT_PER_DAY", "5"))          # 5 фото/день
+AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.5"))    # фільтр confidence
+AI_CACHE_FILE = "ai_cache.json"                                     # кеш по фото
+AI_USAGE_FILE = "ai_usage.json"                                     # ліміт по днях
+
+
+def _load_json_file(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json_file(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _today_key():
+    return datetime.now(UA_TZ).strftime("%Y-%m-%d")
+
+
+def _img_hash(img_bytes: bytes) -> str:
+    return hashlib.sha256(img_bytes).hexdigest()
+
+
+def _can_use_ai(uid: str) -> tuple[bool, int]:
+    usage = _load_json_file(AI_USAGE_FILE, {})
+    today = _today_key()
+
+    usage.setdefault(today, {})
+    usage[today].setdefault(uid, 0)
+
+    used = int(usage[today][uid])
+    remaining = max(0, AI_LIMIT_PER_DAY - used)
+    return (used < AI_LIMIT_PER_DAY, remaining)
+
+
+def _inc_ai_usage(uid: str):
+    usage = _load_json_file(AI_USAGE_FILE, {})
+    today = _today_key()
+
+    usage.setdefault(today, {})
+    usage[today].setdefault(uid, 0)
+
+    usage[today][uid] = int(usage[today][uid]) + 1
+    _save_json_file(AI_USAGE_FILE, usage)
+
+
+def _filter_deadlines_by_confidence(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {"deadlines": []}
+
+    items = payload.get("deadlines", [])
+    if not isinstance(items, list):
+        return {"deadlines": []}
+
+    filtered = []
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        conf = d.get("confidence", 0.0)
+        try:
+            conf = float(conf)
+        except Exception:
+            conf = 0.0
+
+        if conf >= AI_MIN_CONFIDENCE:
+            filtered.append(d)
+
+    return {"deadlines": filtered, "min_confidence": AI_MIN_CONFIDENCE}
+
+
+def get_ai_client():
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        return None
+    return OpenAI(api_key=key)
 
 
 # ===================================================
@@ -131,17 +210,46 @@ def delete_deadline(user_id):
 
 
 # ===================================================
-# 🤖 AI SCAN IMAGE (NO OCR) -> JSON deadlines
+# 🤖 AI SCAN IMAGE (NO OCR) + LIMIT + CACHE + CONF FILTER
 # ===================================================
 @app.post("/api/scan_deadlines_ai")
 def scan_deadlines_ai():
     if "image" not in request.files:
         return jsonify({"error": "no_image"}), 400
 
+    uid = request.form.get("uid") or request.args.get("uid") or "unknown"
+
     file = request.files["image"]
     img_bytes = file.read()
     if not img_bytes:
         return jsonify({"error": "empty_file"}), 400
+
+    # 1) CACHE: одне і те саме фото -> 0 викликів AI
+    img_key = _img_hash(img_bytes)
+    cache = _load_json_file(AI_CACHE_FILE, {})
+    if img_key in cache:
+        cached_payload = cache[img_key]
+        filtered = _filter_deadlines_by_confidence(cached_payload)
+        return jsonify({
+            "cached": True,
+            "uid": uid,
+            **filtered
+        }), 200
+
+    # 2) LIMIT: 5 фото/день на юзера
+    allowed, remaining = _can_use_ai(uid)
+    if not allowed:
+        return jsonify({
+            "error": "rate_limited",
+            "uid": uid,
+            "limit_per_day": AI_LIMIT_PER_DAY,
+            "message": "Ліміт AI на сьогодні вичерпаний. Спробуй завтра або зменш кількість сканів."
+        }), 429
+
+    # 3) KEY CHECK + client
+    client = get_ai_client()
+    if not client:
+        return jsonify({"error": "no_openai_key", "hint": "Set OPENAI_API_KEY in Render env"}), 500
 
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
     today = datetime.now(UA_TZ).strftime("%Y-%m-%d")
@@ -172,7 +280,7 @@ def scan_deadlines_ai():
 """
 
     try:
-        resp = ai.responses.create(
+        resp = client.responses.create(
             model="gpt-4.1-mini",
             input=[
                 {
@@ -185,14 +293,32 @@ def scan_deadlines_ai():
             ],
             text={"format": {"type": "json_object"}},
         )
-        return jsonify(resp.output_parsed), 200
+
+        payload = resp.output_parsed if isinstance(resp.output_parsed, dict) else {"deadlines": []}
+
+        # 4) save cache (сирий результат)
+        cache[img_key] = payload
+        _save_json_file(AI_CACHE_FILE, cache)
+
+        # 5) usage++
+        _inc_ai_usage(uid)
+
+        # 6) filter confidence
+        filtered = _filter_deadlines_by_confidence(payload)
+
+        return jsonify({
+            "cached": False,
+            "uid": uid,
+            "remaining_today": max(0, remaining - 1),
+            **filtered
+        }), 200
 
     except Exception as e:
         return jsonify({"error": "ai_failed", "detail": str(e)}), 500
 
 
 # ===================================================
-# ✅ ADD AI SCANNED -> save to deadlines.json (same format as other deadlines)
+# ✅ ADD AI SCANNED -> save to deadlines.json
 # ===================================================
 @app.post("/api/add_ai_scanned/<user_id>")
 def add_ai_scanned(user_id):
@@ -253,7 +379,7 @@ def google_login(user_id):
 
 
 # ===================================================
-# GOOGLE CALLBACK (saves token + imports calendar & gmail)
+# GOOGLE CALLBACK
 # ===================================================
 @app.get("/api/google_callback")
 def google_callback():
@@ -401,7 +527,6 @@ def import_gmail(user_id, creds):
         if not date_header:
             continue
 
-        # Простіше, як у твоєму коді: ставимо дедлайн на кінець дня
         try:
             date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
             date_str = date_obj.strftime("%Y-%m-%d 23:59")
