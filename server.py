@@ -2,19 +2,15 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
 import os
-import re
-import shutil
-from datetime import datetime, timedelta
-from io import BytesIO
+import base64
+from datetime import datetime
 import requests
+from zoneinfo import ZoneInfo
 
-# OCR
-from PIL import Image, ImageOps
-import pytesseract
-import dateparser
-from dateutil import tz
+# OpenAI (ШІ)
+from openai import OpenAI
 
-# Google API imports
+# Google API
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -26,19 +22,15 @@ from googleapiclient.discovery import build
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-UA_TZ = tz.gettz("Europe/Kyiv")
+UA_TZ = ZoneInfo("Europe/Kyiv")
 
 
 # ===================================================
-# CONFIG
+# CONFIG (як ти просив — хардкод)
 # ===================================================
 BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
 
-# Якщо Google OAuth має працювати на docker-сервісі (nahadayka-backend-1),
-# зміни на "https://nahadayka-backend-1.onrender.com"
-# і додай redirect URI в Google Console.
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
-
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 
 DATA_FILE = "deadlines.json"
@@ -49,6 +41,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
 REDIRECT_URI = f"{BACKEND_URL}/api/google_callback"
+
+
+# ===================================================
+# OPENAI
+# ===================================================
+ai = OpenAI()  # OPENAI_API_KEY має бути в Render env
 
 
 # ===================================================
@@ -133,270 +131,98 @@ def delete_deadline(user_id):
 
 
 # ===================================================
-# ✅ OCR HEALTHCHECK
+# 🤖 AI SCAN IMAGE (NO OCR) -> JSON deadlines
 # ===================================================
-@app.get("/api/ocr_health")
-def ocr_health():
-    info = {
-        "which_tesseract": shutil.which("tesseract"),
-        "tesseract_version": None,
-        "error": None
-    }
-    try:
-        info["tesseract_version"] = str(pytesseract.get_tesseract_version())
-    except Exception as e:
-        info["error"] = str(e)
-    return jsonify(info), 200
-
-
-# ===================================================
-# OCR HELPERS
-# ===================================================
-def _preprocess_image(img: Image.Image) -> Image.Image:
-    img = ImageOps.exif_transpose(img)
-    img = img.convert("L")
-    img.thumbnail((1600, 1600))  # щоб не з'їдало RAM
-    img = ImageOps.autocontrast(img)
-    return img
-
-
-def _ocr_text_from_bytes(img_bytes: bytes) -> str:
-    img = Image.open(BytesIO(img_bytes))
-    img = _preprocess_image(img)
-
-    config = "--oem 1 --psm 6"
-    # якщо "ukr" не встановлений — буде помилка, але в тебе ocr_health ок
-    text = pytesseract.image_to_string(img, lang="ukr+eng", config=config)
-    return text or ""
-
-
-def _split_lines(text: str) -> list[str]:
-    lines = []
-    for raw in (text or "").splitlines():
-        line = re.sub(r"\s+", " ", raw).strip()
-        if len(line) >= 3:
-            lines.append(line)
-    return lines
-
-
-def _normalize_ocr_line(line: str) -> str:
-    return re.sub(r"\s+", " ", (line or "")).strip()
-
-
-def _parse_dt(candidate: str):
-    return dateparser.parse(
-        candidate,
-        languages=["uk", "ru", "en"],
-        settings={
-            "TIMEZONE": "Europe/Kyiv",
-            "RETURN_AS_TIMEZONE_AWARE": True,
-            "PREFER_DATES_FROM": "future",
-        }
-    )
-
-
-# ⚠️ ФІКС: робимо non-capturing (?:...), щоб групи regex не ламались
-UA_MONTHS = r"(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)"
-RU_MONTHS = r"(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
-
-UA_MONTH_MAP = {
-    "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
-    "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12
-}
-RU_MONTH_MAP = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
-    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
-}
-
-
-def _extract_datetime_from_line(line: str):
-    """
-    Повертає (date_str 'YYYY-MM-DD HH:MM', title)
-
-    Підтримує:
-      - 12.01.2026 14:30
-      - 12/01 14:30
-      - 2026-01-12 14:30
-      - "сьогодні 18:00", "завтра 9:00"
-      - "21 січня 2026", "21 січня"
-      - "21 января 2026"
-      - "18:00" (тільки час) -> сьогодні/завтра
-    """
-    line = _normalize_ocr_line(line)
-    low = line.lower()
-
-    # ===================================================
-    # 1) HARD PARSE: "21 січня 2026" / "21 января 2026"
-    # ✅ стабільні групи: (day) (month) (year?) (hh?) (mm?)
-    # ===================================================
-    m = re.search(
-        rf"\b(\d{{1,2}})\s+({UA_MONTHS}|{RU_MONTHS})(?:\s+(\d{{4}}))?(?:\s+(\d{{1,2}}):(\d{{2}}))?\b",
-        low
-    )
-    if m:
-        try:
-            day = int(m.group(1))
-            month_name = m.group(2)  # ✅ тут тільки назва місяця
-            year = int(m.group(3)) if m.group(3) else datetime.now(UA_TZ).year
-            hh = int(m.group(4)) if m.group(4) else 23
-            mm = int(m.group(5)) if m.group(5) else 59
-
-            month = UA_MONTH_MAP.get(month_name) or RU_MONTH_MAP.get(month_name)
-            if month:
-                dt = datetime(year, month, day, hh, mm, tzinfo=UA_TZ)
-                date_str = dt.strftime("%Y-%m-%d %H:%M")
-
-                used = m.group(0)
-                title = re.sub(re.escape(used), "", line, flags=re.IGNORECASE).strip(" -–—:;,")
-                title = title.strip() or "Дедлайн з фото"
-                return date_str, title
-        except Exception:
-            pass
-
-    # ===================================================
-    # 2) DATEPARSER: цифрові формати + слова сьогодні/завтра
-    # ===================================================
-    candidates = []
-
-    candidates += re.findall(
-        r"\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?(?:\s+\d{1,2}:\d{2})?\b",
-        low
-    )
-    candidates += re.findall(
-        r"\b\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?\b",
-        low
-    )
-
-    if any(w in low for w in ["сьогодні", "завтра", "післязавтра", "сегодня", "послезавтра"]):
-        candidates.append(low)
-
-    time_only = re.findall(r"\b\d{1,2}:\d{2}\b", low)
-
-    dt = None
-    used = None
-
-    for c in candidates:
-        parsed = _parse_dt(c)
-        if parsed:
-            dt = parsed
-            used = c
-            break
-
-    # ===================================================
-    # 3) тільки час -> сьогодні/завтра
-    # ===================================================
-    if not dt and time_only:
-        parsed_time = dateparser.parse(time_only[0], languages=["uk", "ru", "en"])
-        if parsed_time:
-            now = datetime.now(UA_TZ)
-            dt_candidate = now.replace(
-                hour=parsed_time.hour,
-                minute=parsed_time.minute,
-                second=0,
-                microsecond=0
-            )
-            if dt_candidate < now:
-                dt_candidate = dt_candidate + timedelta(days=1)
-            dt = dt_candidate
-            used = time_only[0]
-
-    if not dt:
-        return None, None
-
-    # якщо часу нема -> 23:59
-    if not re.search(r"\b\d{1,2}:\d{2}\b", low):
-        dt = dt.replace(hour=23, minute=59, second=0, microsecond=0)
-
-    date_str = dt.astimezone(UA_TZ).strftime("%Y-%m-%d %H:%M")
-
-    title = line
-    if used and len(used) < len(line):
-        title = re.sub(re.escape(used), "", title, flags=re.IGNORECASE).strip(" -–—:;,")
-    title = title.strip() or "Дедлайн з фото"
-
-    return date_str, title
-
-
-def _extract_items_from_text(text: str) -> list[dict]:
-    lines = _split_lines(text)
-    items = []
-    seen = set()
-
-    for line in lines:
-        date_str, title = _extract_datetime_from_line(line)
-        if not date_str:
-            continue
-
-        key = (title.lower(), date_str)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        items.append({"title": title, "date": date_str})
-
-    return items
-
-
-# ===================================================
-# 📷 SCAN IMAGE (REAL OCR)
-# ===================================================
-@app.post("/api/scan_image")
-def scan_image():
+@app.post("/api/scan_deadlines_ai")
+def scan_deadlines_ai():
     if "image" not in request.files:
-        return jsonify({"items": [], "error": "no_image"}), 400
+        return jsonify({"error": "no_image"}), 400
 
     file = request.files["image"]
     img_bytes = file.read()
-
     if not img_bytes:
-        return jsonify({"items": [], "error": "empty_file"}), 400
+        return jsonify({"error": "empty_file"}), 400
 
-    uid = request.form.get("uid") or request.args.get("uid") or "unknown"
-    print(f"[scan_image] uid={uid}, filename={file.filename}, bytes={len(img_bytes)}")
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    today = datetime.now(UA_TZ).strftime("%Y-%m-%d")
+
+    prompt = f"""
+Ти аналізуєш фото (зошит, чат, дошка, розклад).
+Знайди ВСІ дедлайни.
+
+Сьогодні: {today}
+Часова зона: Europe/Kyiv
+
+Поверни ТІЛЬКИ JSON:
+{{
+  "deadlines": [
+    {{
+      "title": "що треба зробити/здати",
+      "due_date": "YYYY-MM-DD або null",
+      "due_time": "HH:MM або null",
+      "confidence": 0.0
+    }}
+  ]
+}}
+
+Правила:
+- Якщо часу нема — due_time = "23:59"
+- Якщо дата відносна (завтра/понеділок) — перетвори в конкретну дату
+- confidence 0..1
+"""
 
     try:
-        text = _ocr_text_from_bytes(img_bytes)
+        resp = ai.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"},
+                    ],
+                }
+            ],
+            text={"format": {"type": "json_object"}},
+        )
+        return jsonify(resp.output_parsed), 200
+
     except Exception as e:
-        print("[OCR ERROR]", repr(e))
-        return jsonify({"items": [], "error": "ocr_failed", "detail": str(e)}), 500
-
-    items = _extract_items_from_text(text)
-
-    return jsonify({
-        "items": items,
-        "raw_text": (text or "")[:4000]
-    }), 200
+        return jsonify({"error": "ai_failed", "detail": str(e)}), 500
 
 
 # ===================================================
-# ✅ ADD SCANNED ITEMS
+# ✅ ADD AI SCANNED -> save to deadlines.json (same format as other deadlines)
 # ===================================================
-@app.post("/api/add_scanned/<user_id>")
-def add_scanned(user_id):
+@app.post("/api/add_ai_scanned/<user_id>")
+def add_ai_scanned(user_id):
     body = request.get_json() or {}
-    items = body.get("items") or []
+    deadlines = body.get("deadlines") or []
 
-    if not isinstance(items, list) or not items:
-        return jsonify({"error": "items required", "added": 0}), 400
+    if not isinstance(deadlines, list) or not deadlines:
+        return jsonify({"error": "deadlines required", "added": 0}), 400
 
     data = load_deadlines()
     data.setdefault(user_id, [])
 
     added = 0
-    for it in items:
-        title = str((it or {}).get("title", "")).strip()
-        date = str((it or {}).get("date", "")).strip()
+    for d in deadlines:
+        title = str((d or {}).get("title", "")).strip()
+        due_date = (d or {}).get("due_date")
+        due_time = (d or {}).get("due_time") or "23:59"
 
-        if not title or not date:
+        if not title or not due_date:
             continue
 
-        exists = any(d.get("title") == title and d.get("date") == date for d in data[user_id])
+        date_value = f"{due_date} {due_time}"
+
+        exists = any(x.get("title") == title and x.get("date") == date_value for x in data[user_id])
         if exists:
             continue
 
         data[user_id].append({
             "title": title,
-            "date": date,
+            "date": date_value,
             "last_notified": None
         })
         added += 1
@@ -427,7 +253,7 @@ def google_login(user_id):
 
 
 # ===================================================
-# GOOGLE CALLBACK
+# GOOGLE CALLBACK (saves token + imports calendar & gmail)
 # ===================================================
 @app.get("/api/google_callback")
 def google_callback():
@@ -468,7 +294,7 @@ def google_callback():
 
 
 # ===================================================
-# GOOGLE SYNC
+# GOOGLE SYNC (manual)
 # ===================================================
 @app.post("/api/google_sync/<user_id>")
 def google_sync(user_id):
@@ -575,6 +401,7 @@ def import_gmail(user_id, creds):
         if not date_header:
             continue
 
+        # Простіше, як у твоєму коді: ставимо дедлайн на кінець дня
         try:
             date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
             date_str = date_obj.strftime("%Y-%m-%d 23:59")
