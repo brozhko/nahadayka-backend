@@ -27,11 +27,11 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 UA_TZ = ZoneInfo("Europe/Kyiv")
 
-
 # ===================================================
-# CONFIG (як ти просив — хардкод)
+# CONFIG
 # ===================================================
-BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
+# ⚠️ Встав свій токен сюди (як було)
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
 
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
@@ -44,7 +44,6 @@ SCOPES = [
 ]
 REDIRECT_URI = f"{BACKEND_URL}/api/google_callback"
 
-
 # ===================================================
 # DB (SQLite local, Postgres on Render via DATABASE_URL)
 # ===================================================
@@ -52,11 +51,8 @@ db_url = os.environ.get("DATABASE_URL", "").strip()
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-# Якщо на Render задано DATABASE_URL -> Postgres.
-# Якщо ні -> локально SQLite файл.
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url or "sqlite:///db.sqlite3"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
 db = SQLAlchemy(app)
 
 
@@ -71,7 +67,7 @@ class Deadline(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
 
-    # ВАЖЛИВО: поле називається date, бо твої фічі/бот так очікують
+    # ВАЖЛИВО: поле називається date, бо фронт/бот так очікують
     title = db.Column(db.String(255), nullable=False)
     date = db.Column(db.String(32), nullable=False)  # "YYYY-MM-DD HH:MM"
     last_notified = db.Column(db.Integer, nullable=True)
@@ -110,12 +106,12 @@ def _all_users_dict():
 
 
 # ===================================================
-# AI LIMITS + CACHE (anti-balance-eater)
+# AI LIMITS + CACHE
 # ===================================================
-AI_LIMIT_PER_DAY = int(os.getenv("AI_LIMIT_PER_DAY", "5"))          # 5 фото/день
-AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.5"))    # фільтр confidence
-AI_CACHE_FILE = "ai_cache.json"                                     # кеш по фото
-AI_USAGE_FILE = "ai_usage.json"                                     # ліміт по днях
+AI_LIMIT_PER_DAY = int(os.getenv("AI_LIMIT_PER_DAY", "5"))
+AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.5"))
+AI_CACHE_FILE = "ai_cache.json"
+AI_USAGE_FILE = "ai_usage.json"
 
 
 def _load_json_file(path: str, default):
@@ -194,14 +190,9 @@ def get_ai_client():
 
 
 def _openai_response_to_json(resp) -> dict:
-    """
-    openai==2.x: resp.output_parsed може НЕ існувати.
-    Беремо resp.output_text (рядок), і парсимо як JSON.
-    """
     raw = getattr(resp, "output_text", None)
 
     if not raw:
-        # fallback: витягнути текст з output/content
         try:
             parts = []
             for item in (getattr(resp, "output", None) or []):
@@ -228,14 +219,14 @@ def all_users():
 
 
 # ===================================================
-# DEADLINES API (НЕ ЛАМАЄМО ФОРМАТ)
+# DEADLINES API (формат НЕ міняємо)
 # ===================================================
 @app.post("/api/deadlines/<user_id>")
 def add_or_update_deadline(user_id):
-    body = request.get_json() or {}
+    body = request.get_json(silent=True) or {}
     user = _get_or_create_user(user_id)
 
-    # ✅ update last_notified (як було)
+    # update last_notified (як було)
     if "last_notified_update" in body and "title" in body:
         title = str(body.get("title", "")).strip()
         new_val = body.get("last_notified_update")
@@ -248,14 +239,13 @@ def add_or_update_deadline(user_id):
         db.session.commit()
         return jsonify({"updated": True})
 
-    # ✅ add deadline (як було: title + date)
+    # add deadline (як було)
     title = str(body.get("title", "")).strip()
     date = str(body.get("date", "")).strip()
 
     if not title or not date:
         return jsonify({"error": "title and date required"}), 400
 
-    # (опційно) не дублюємо точні співпадіння
     exists = Deadline.query.filter_by(user_id=user.id, title=title, date=date).first()
     if exists:
         return jsonify({"status": "exists"}), 200
@@ -272,7 +262,7 @@ def get_deadlines(user_id):
 
 @app.delete("/api/deadlines/<user_id>")
 def delete_deadline(user_id):
-    body = request.get_json() or {}
+    body = request.get_json(silent=True) or {}
     title = str(body.get("title", "")).strip()
 
     if not title:
@@ -284,12 +274,11 @@ def delete_deadline(user_id):
 
     Deadline.query.filter_by(user_id=user.id, title=title).delete()
     db.session.commit()
-
     return jsonify({"status": "ok"})
 
 
 # ===================================================
-# 🤖 AI SCAN IMAGE (NO OCR) + LIMIT + CACHE + CONF FILTER
+# 🤖 AI SCAN IMAGE (FIX MIME + SIZE LIMIT)
 # ===================================================
 @app.post("/api/scan_deadlines_ai")
 def scan_deadlines_ai():
@@ -303,7 +292,15 @@ def scan_deadlines_ai():
     if not img_bytes:
         return jsonify({"error": "empty_file"}), 400
 
-    # 1) CACHE: одне і те саме фото -> 0 викликів AI
+    # ✅ ліміт (щоб не падало на великих фотках)
+    MAX_MB = 8
+    if len(img_bytes) > MAX_MB * 1024 * 1024:
+        return jsonify({
+            "error": "too_large",
+            "message": f"Фото завелике (> {MAX_MB}MB). Зроби інше або стисни."
+        }), 413
+
+    # 1) CACHE
     img_key = _img_hash(img_bytes)
     cache = _load_json_file(AI_CACHE_FILE, {})
     if img_key in cache:
@@ -315,7 +312,7 @@ def scan_deadlines_ai():
             **filtered
         }), 200
 
-    # 2) LIMIT: 5 фото/день на юзера
+    # 2) LIMIT
     allowed, remaining = _can_use_ai(uid)
     if not allowed:
         return jsonify({
@@ -325,10 +322,22 @@ def scan_deadlines_ai():
             "message": "Ліміт AI на сьогодні вичерпаний. Спробуй завтра або зменш кількість сканів."
         }), 429
 
-    # 3) KEY CHECK + client
+    # 3) KEY CHECK
     client = get_ai_client()
     if not client:
         return jsonify({"error": "no_openai_key", "hint": "Set OPENAI_API_KEY in Render env"}), 500
+
+    # ✅ MIME FIX (це головний фікс для камери/телефону)
+    mime = (file.mimetype or "").strip().lower()
+    if not mime.startswith("image/"):
+        mime = "image/jpeg"
+
+    # ⚠️ HEIC/HEIF інколи не підтримується. Якщо впаде — краще відловити одразу.
+    if mime in ("image/heic", "image/heif"):
+        return jsonify({
+            "error": "unsupported_image",
+            "message": "Формат HEIC/HEIF може не підтримуватись. Увімкни 'Most Compatible' в камері або зроби скріншот фото."
+        }), 415
 
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
     today = datetime.now(UA_TZ).strftime("%Y-%m-%d")
@@ -366,7 +375,7 @@ def scan_deadlines_ai():
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"},
+                        {"type": "input_image", "image_url": f"data:{mime};base64,{img_b64}"},
                     ],
                 }
             ],
@@ -375,7 +384,7 @@ def scan_deadlines_ai():
 
         payload = _openai_response_to_json(resp)
 
-        # 4) save cache (сирий результат)
+        # 4) cache
         cache[img_key] = payload
         _save_json_file(AI_CACHE_FILE, cache)
 
@@ -397,11 +406,11 @@ def scan_deadlines_ai():
 
 
 # ===================================================
-# ✅ ADD AI SCANNED -> save to DB (НЕ ЛАМАЄМО ФІЧУ)
+# ✅ ADD AI SCANNED -> save to DB
 # ===================================================
 @app.post("/api/add_ai_scanned/<user_id>")
 def add_ai_scanned(user_id):
-    body = request.get_json() or {}
+    body = request.get_json(silent=True) or {}
     deadlines = body.get("deadlines") or []
 
     if not isinstance(deadlines, list) or not deadlines:
@@ -511,7 +520,7 @@ def google_sync(user_id):
 
 
 # ===================================================
-# IMPORT EVENTS FROM CALENDAR (в DB)
+# IMPORT EVENTS FROM CALENDAR (to DB)
 # ===================================================
 def import_google_calendar(user_id, creds):
     try:
@@ -530,7 +539,6 @@ def import_google_calendar(user_id, creds):
     ).execute()
 
     events = result.get("items", [])
-
     user = _get_or_create_user(user_id)
 
     imported = 0
@@ -562,7 +570,7 @@ def import_google_calendar(user_id, creds):
 
 
 # ===================================================
-# 📧 IMPORT FROM GMAIL (LPNU + KEYWORDS) (в DB)
+# 📧 IMPORT FROM GMAIL (to DB)
 # ===================================================
 KEYWORDS = [k.lower() for k in ["лаба", "лаб", "завдання", "звіт", "робота", "кр", "практична"]]
 LPNU_DOMAIN = "@lpnu.ua"
@@ -583,7 +591,6 @@ def import_gmail(user_id, creds):
     ).execute()
 
     messages = result.get("messages", [])
-
     user = _get_or_create_user(user_id)
 
     added = 0
