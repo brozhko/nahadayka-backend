@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
 import os
@@ -29,14 +29,18 @@ UA_TZ = ZoneInfo("Europe/Kyiv")
 
 
 # ===================================================
-# CONFIG (тут лишаємо токени, як ти хочеш)
+# CONFIG
 # ===================================================
-BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
-BOT_USERNAME = "nahadayka_bot" 
+# ✅ BOT TOKEN лишається в коді (як ти хотів)
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+BOT_USERNAME = os.getenv("BOT_USERNAME", "nahadayka_bot").strip()
 
+# ✅ Render ENV (можна теж лишити як є, але краще щоб можна було змінювати без коду)
+BACKEND_URL = os.getenv("BACKEND_URL", "https://nahadayka-backend.onrender.com").strip()
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://brozhko.github.io/nahadayka-bot_v1/").strip()
 
-BACKEND_URL = "https://nahadayka-backend.onrender.com"
-WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
+# ✅ OpenAI key з Render
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 CLIENT_SECRETS_FILE = "credentials.json"
 SCOPES = [
@@ -111,7 +115,7 @@ def _all_users_dict():
 
 
 # ===================================================
-# TELEGRAM SEND (надійно, з кнопкою web_app)
+# TELEGRAM SEND (з кнопкою web_app)
 # ===================================================
 def tg_send_message(chat_id: str, text: str):
     if not BOT_TOKEN or BOT_TOKEN.startswith("PASTE_"):
@@ -123,7 +127,6 @@ def tg_send_message(chat_id: str, text: str):
         ]
     }
 
-    # додатково: кнопка на бота (якщо вказаний username)
     if BOT_USERNAME and (not BOT_USERNAME.startswith("PASTE_")):
         kb["inline_keyboard"].append(
             [{"text": "🤖 Відкрити бота", "url": f"https://t.me/{BOT_USERNAME}"}]
@@ -168,7 +171,7 @@ def _save_json_file(path: str, data):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
-        # на Render файлова система може бути нестабільна між деплоями — але це ок для кешу
+        # Render може “затирати” файлову систему між деплоями — кеш просто не буде довгим
         pass
 
 
@@ -183,7 +186,6 @@ def _img_hash(img_bytes: bytes) -> str:
 def _can_use_ai(uid: str):
     usage = _load_json_file(AI_USAGE_FILE, {})
     today = _today_key()
-
     usage.setdefault(today, {})
     usage[today].setdefault(uid, 0)
 
@@ -195,10 +197,8 @@ def _can_use_ai(uid: str):
 def _inc_ai_usage(uid: str):
     usage = _load_json_file(AI_USAGE_FILE, {})
     today = _today_key()
-
     usage.setdefault(today, {})
     usage[today].setdefault(uid, 0)
-
     usage[today][uid] = int(usage[today][uid]) + 1
     _save_json_file(AI_USAGE_FILE, usage)
 
@@ -228,6 +228,7 @@ def _filter_deadlines_by_confidence(payload: dict) -> dict:
 
 
 def get_ai_client():
+    # ✅ тепер нормально читає ключ з Render ENV
     key = (OPENAI_API_KEY or "").strip()
     if not key or key.startswith("PASTE_"):
         return None
@@ -264,14 +265,13 @@ def all_users():
 
 
 # ===================================================
-# DEADLINES API (НЕ міняємо формат)
+# DEADLINES API
 # ===================================================
 @app.post("/api/deadlines/<user_id>")
 def add_or_update_deadline(user_id):
     body = request.get_json(silent=True) or {}
     user = _get_or_create_user(user_id)
 
-    # update last_notified (як було)
     if "last_notified_update" in body and "title" in body:
         title = str(body.get("title", "")).strip()
         new_val = body.get("last_notified_update")
@@ -284,7 +284,6 @@ def add_or_update_deadline(user_id):
         db.session.commit()
         return jsonify({"updated": True})
 
-    # add deadline (як було)
     title = str(body.get("title", "")).strip()
     date = str(body.get("date", "")).strip()
 
@@ -323,7 +322,7 @@ def delete_deadline(user_id):
 
 
 # ===================================================
-# 🤖 AI SCAN IMAGE (MIME FIX + SIZE LIMIT)
+# 🤖 AI SCAN IMAGE
 # ===================================================
 @app.post("/api/scan_deadlines_ai")
 def scan_deadlines_ai():
@@ -337,7 +336,6 @@ def scan_deadlines_ai():
     if not img_bytes:
         return jsonify({"error": "empty_file"}), 400
 
-    # size limit
     MAX_MB = 8
     if len(img_bytes) > MAX_MB * 1024 * 1024:
         return jsonify({
@@ -345,19 +343,13 @@ def scan_deadlines_ai():
             "message": f"Фото завелике (> {MAX_MB}MB). Зроби інше або стисни."
         }), 413
 
-    # CACHE
     img_key = _img_hash(img_bytes)
     cache = _load_json_file(AI_CACHE_FILE, {})
     if img_key in cache:
         cached_payload = cache[img_key]
         filtered = _filter_deadlines_by_confidence(cached_payload)
-        return jsonify({
-            "cached": True,
-            "uid": uid,
-            **filtered
-        }), 200
+        return jsonify({"cached": True, "uid": uid, **filtered}), 200
 
-    # LIMIT
     allowed, remaining = _can_use_ai(uid)
     if not allowed:
         return jsonify({
@@ -371,7 +363,6 @@ def scan_deadlines_ai():
     if not client:
         return jsonify({"error": "no_openai_key"}), 500
 
-    # MIME FIX
     mime = (file.mimetype or "").strip().lower()
     if not mime.startswith("image/"):
         mime = "image/jpeg"
@@ -413,25 +404,21 @@ def scan_deadlines_ai():
     try:
         resp = client.responses.create(
             model="gpt-4.1-mini",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": f"data:{mime};base64,{img_b64}"},
-                    ],
-                }
-            ],
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": f"data:{mime};base64,{img_b64}"},
+                ],
+            }],
             text={"format": {"type": "json_object"}},
         )
 
         payload = _openai_response_to_json(resp)
 
-        # cache save
         cache[img_key] = payload
         _save_json_file(AI_CACHE_FILE, cache)
 
-        # usage++
         _inc_ai_usage(uid)
 
         filtered = _filter_deadlines_by_confidence(payload)
@@ -504,7 +491,7 @@ def google_login(user_id):
 
 
 # ===================================================
-# GOOGLE CALLBACK (гарна сторінка + авто-повернення)
+# GOOGLE CALLBACK (✅ красивіше + авто-повернення)
 # ===================================================
 @app.get("/api/google_callback")
 def google_callback():
@@ -526,14 +513,12 @@ def google_callback():
     except Exception as e:
         return f"<h3>Google token error</h3><pre>{str(e)}</pre>", 500
 
-    # зберігаємо токен
     try:
         with open(f"token_{user_id}.json", "w", encoding="utf-8") as f:
             f.write(creds.to_json())
     except Exception as e:
         return f"<h3>Token save error</h3><pre>{str(e)}</pre>", 500
 
-    # імпорт (рахуємо, але НЕ показуємо на сайті)
     imported_calendar = 0
     imported_gmail = 0
     try:
@@ -546,27 +531,18 @@ def google_callback():
     except Exception:
         imported_gmail = 0
 
-    # ✅ повідомлення в Telegram чаті (ОСЬ ТУТ БУДЕ ПИСАТИ)
     msg = (
         f"✅ Google підключено!\n"
         f"📅 Календар: імпортовано {imported_calendar} подій\n"
         f"📧 Gmail: знайдено {imported_gmail} листів із завданнями"
     )
+    try:
+        tg_send_message(user_id, msg)
+    except Exception:
+        pass
 
-    if BOT_TOKEN:
-        try:
-            requests.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                params={"chat_id": user_id, "text": msg},
-                timeout=15
-            )
-        except Exception:
-            pass
-
-    # ✅ повернення в Telegram (чат з ботом)
     tg_link = f"https://t.me/{BOT_USERNAME}?start=google_done"
 
-    # ✅ на сайті: НІЯКИХ цифр/тексту про імпорт
     html = f"""
 <!doctype html>
 <html lang="uk">
@@ -575,35 +551,99 @@ def google_callback():
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Готово</title>
   <style>
+    :root {{
+      --bg1:#0B121C; --bg2:#0F1B2E; --card:#121B2A; --txt:#E8EEF6;
+      --muted:rgba(232,238,246,.78); --b:rgba(255,255,255,.10);
+      --accent:#2B6CFF; --accent2:#7C5CFF;
+    }}
+    *{{ box-sizing:border-box; }}
     body {{
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      margin: 0; padding: 24px;
-      background: #0B121C; color: #E8EEF6;
+      margin:0; min-height:100vh;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      color:var(--txt);
+      background:
+        radial-gradient(900px 500px at 20% 10%, rgba(43,108,255,.22), transparent 60%),
+        radial-gradient(700px 420px at 80% 30%, rgba(124,92,255,.18), transparent 60%),
+        linear-gradient(180deg, var(--bg1), var(--bg2));
+      display:flex; align-items:center; justify-content:center;
+      padding: 24px;
     }}
+    .wrap {{ width:min(560px, 100%); }}
     .card {{
-      max-width: 520px; margin: 40px auto;
-      background: #121B2A; border: 1px solid rgba(255,255,255,.08);
-      border-radius: 16px; padding: 20px;
-      box-shadow: 0 10px 30px rgba(0,0,0,.35);
+      background: rgba(18,27,42,.92);
+      border:1px solid var(--b);
+      border-radius: 18px;
+      padding: 22px;
+      box-shadow: 0 18px 55px rgba(0,0,0,.45);
+      backdrop-filter: blur(10px);
     }}
-    h1 {{ font-size: 20px; margin: 0 0 10px; }}
-    .meta {{ opacity: .85; line-height: 1.5; }}
+    .top {{
+      display:flex; gap:14px; align-items:center;
+      margin-bottom: 10px;
+    }}
+    .icon {{
+      width:44px; height:44px; border-radius: 14px;
+      display:grid; place-items:center;
+      background: linear-gradient(135deg, rgba(43,108,255,.25), rgba(124,92,255,.22));
+      border: 1px solid var(--b);
+      flex: 0 0 auto;
+    }}
+    h1 {{ margin:0; font-size:20px; }}
+    .meta {{ margin: 6px 0 0; color:var(--muted); line-height:1.55; }}
+    .row {{
+      display:flex; gap:12px; align-items:center; margin-top: 16px; flex-wrap:wrap;
+    }}
     .btn {{
-      display: inline-block; margin-top: 16px;
-      background: #2B6CFF; color: white; text-decoration: none;
-      padding: 12px 14px; border-radius: 12px;
-      font-weight: 700;
+      display:inline-flex; align-items:center; justify-content:center;
+      gap:10px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color:white; text-decoration:none;
+      padding: 12px 14px; border-radius: 14px;
+      font-weight: 800;
+      border: 1px solid rgba(255,255,255,.14);
+      box-shadow: 0 12px 30px rgba(43,108,255,.22);
     }}
-    .small {{ opacity: .7; margin-top: 10px; font-size: 13px; }}
+    .btn:active {{ transform: translateY(1px); }}
+    .pill {{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--b);
+      color: var(--muted);
+      background: rgba(255,255,255,.04);
+      font-size: 13px;
+    }}
+    .spin {{
+      width:14px; height:14px;
+      border-radius:50%;
+      border:2px solid rgba(232,238,246,.25);
+      border-top-color: rgba(232,238,246,.85);
+      animation: s 0.9s linear infinite;
+    }}
+    @keyframes s {{ to {{ transform: rotate(360deg); }} }}
+    .small {{ margin-top: 10px; color: rgba(232,238,246,.6); font-size: 12.5px; }}
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>✅ Готово</h1>
-    <div class="meta">Можеш повернутись у Telegram.</div>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <div class="icon">✅</div>
+        <div>
+          <h1>Google підключено</h1>
+          <div class="meta">Можеш повернутись у Telegram. Зараз спробую перекинути автоматично.</div>
+        </div>
+      </div>
 
-    <a class="btn" href="{tg_link}">Повернутись в Telegram</a>
-    <div class="small">Якщо не перекинуло автоматично — натисни кнопку.</div>
+      <div class="row">
+        <a class="btn" href="{tg_link}">Повернутись в Telegram</a>
+        <div class="pill"><span class="spin"></span>Автоповернення…</div>
+      </div>
+
+      <div class="small">
+        Якщо кнопка не відкрилась — відкрий чат з ботом вручну і натисни «Меню» → «Синхронізація».
+      </div>
+    </div>
   </div>
 
   <script>
@@ -615,7 +655,6 @@ def google_callback():
 </html>
 """
     return html
-
 
 
 # ===================================================
@@ -714,13 +753,10 @@ def import_gmail(user_id, creds):
         if not date_header:
             continue
 
-        # фільтр ключових слів
         if not any(k in subject.lower() for k in KEYWORDS):
             continue
 
-        # дата листа -> ставимо як дедлайн "сьогодні 23:59" (як у тебе)
         try:
-            # date_header часто типу: "Mon, 06 Jan 2026 12:34:56 +0200"
             base = date_header[:25]
             date_obj = datetime.strptime(base, "%a, %d %b %Y %H:%M:%S")
             date_str = date_obj.strftime("%Y-%m-%d 23:59")
@@ -752,6 +788,3 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
-
-
-
