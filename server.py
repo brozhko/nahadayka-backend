@@ -513,126 +513,114 @@ def google_callback():
     user_id = request.args.get("state")
 
     if not code or not user_id:
-        return Response("Missing code/state", status=400)
+        return "<h3>Missing code/state</h3>", 400
+
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
 
     try:
-        flow = Flow.from_client_secrets_file(
-            CLIENT_SECRETS_FILE,
-            scopes=SCOPES,
-            redirect_uri=REDIRECT_URI,
-        )
-
         flow.fetch_token(code=code)
         creds = flow.credentials
+    except Exception as e:
+        return f"<h3>Google token error</h3><pre>{str(e)}</pre>", 500
 
-        # зберігаємо токен
+    # зберігаємо токен
+    try:
         with open(f"token_{user_id}.json", "w", encoding="utf-8") as f:
             f.write(creds.to_json())
+    except Exception as e:
+        return f"<h3>Token save error</h3><pre>{str(e)}</pre>", 500
 
+    # імпорт
+    imported_calendar = 0
+    imported_gmail = 0
+    try:
         imported_calendar = import_google_calendar(user_id, creds)
+    except Exception:
+        imported_calendar = 0
+
+    try:
         imported_gmail = import_gmail(user_id, creds)
+    except Exception:
+        imported_gmail = 0
 
-        # шлемо в Telegram
-        msg = (
-            f"✅ Імпорт завершено!\n\n"
-            f"📅 Календар: імпортовано {imported_calendar} подій\n"
-            f"📧 Gmail: знайдено {imported_gmail} листів із завданнями\n\n"
-            f"Відкрий Нагадайку і онови список ✅"
-        )
-        tg_send_message(user_id, msg)
+    # повідомлення в Telegram
+    msg = (
+        f"✅ Google підключено!\n"
+        f"📅 Календар: імпортовано {imported_calendar} подій\n"
+        f"📧 Gmail: знайдено {imported_gmail} листів із завданнями"
+    )
 
-        # гарна HTML-сторінка
-        open_webapp = WEBAPP_URL
-        open_bot = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME and (not BOT_USERNAME.startswith("PASTE_")) else "https://t.me"
+    if BOT_TOKEN:
+        try:
+            requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                params={"chat_id": user_id, "text": msg},
+                timeout=15
+            )
+        except Exception:
+            pass
 
-        html = f"""
+    # ✅ Лінк назад у Telegram (відкриє чат з ботом)
+    tg_link = f"https://t.me/{BOT_USERNAME}?start=google_done"
+
+    # ✅ Гарна сторінка + авто-повернення
+    html = f"""
 <!doctype html>
 <html lang="uk">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Імпорт завершено</title>
-  <meta name="theme-color" content="#0B121C">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Нагадайка — Google підключено</title>
   <style>
     body {{
-      margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      background:#0B121C; color:#fff; display:flex; min-height:100vh; align-items:center; justify-content:center;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      margin: 0; padding: 24px;
+      background: #0B121C; color: #E8EEF6;
     }}
     .card {{
-      width:min(560px, 92vw);
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.10);
-      border-radius: 18px;
-      padding: 18px 16px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      max-width: 520px; margin: 40px auto;
+      background: #121B2A; border: 1px solid rgba(255,255,255,.08);
+      border-radius: 16px; padding: 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.35);
     }}
-    h1 {{ margin:0 0 6px; font-size: 20px; }}
-    .muted {{ color: rgba(255,255,255,0.75); font-size: 14px; margin-bottom: 14px; }}
-    .grid {{ display:grid; gap:10px; margin-top: 12px; }}
+    h1 {{ font-size: 20px; margin: 0 0 10px; }}
+    .meta {{ opacity: .9; line-height: 1.5; }}
     .btn {{
-      display:block; text-decoration:none; text-align:center;
-      padding: 12px 14px; border-radius: 14px; font-weight: 700;
-      border: 1px solid rgba(255,255,255,0.14);
-      background: rgba(255,255,255,0.08); color: #fff;
+      display: inline-block; margin-top: 16px;
+      background: #2B6CFF; color: white; text-decoration: none;
+      padding: 12px 14px; border-radius: 12px;
+      font-weight: 700;
     }}
-    .btn.primary {{
-      background: #2f7cff;
-      border-color: rgba(47,124,255,0.6);
-    }}
-    .stats {{
-      margin-top: 10px;
-      padding: 10px 12px;
-      border-radius: 14px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.10);
-      font-size: 14px;
-      line-height: 1.45;
-    }}
+    .small {{ opacity: .7; margin-top: 10px; font-size: 13px; }}
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>✅ Імпорт завершено</h1>
-    <div class="muted">Тепер повернись у Telegram і онови список дедлайнів.</div>
-
-    <div class="stats">
-      📅 Календар: <b>{imported_calendar}</b><br>
-      📧 Gmail: <b>{imported_gmail}</b>
+    <h1>✅ Google підключено</h1>
+    <div class="meta">
+      📅 Календар: <b>{imported_calendar}</b> подій<br/>
+      📧 Gmail: <b>{imported_gmail}</b> листів
     </div>
 
-    <div class="grid">
-      <a class="btn primary" href="{open_webapp}">📲 Повернутись у Нагадайку</a>
-      <a class="btn" href="{open_bot}">🤖 Відкрити бота</a>
-    </div>
-
-    <div class="muted" style="margin-top:12px;">
-      Якщо не повернуло автоматом — натисни кнопку вище.
-    </div>
+    <a class="btn" href="{tg_link}">Повернутись в Telegram</a>
+    <div class="small">Якщо не перекинуло автоматично — натисни кнопку.</div>
   </div>
 
   <script>
-    // авто-повернення (через 900мс)
-    setTimeout(() => {{
-      window.location.href = "{open_webapp}";
-    }}, 900);
+    // авто-повернення через 1.2с
+    setTimeout(function() {{
+      window.location.href = "{tg_link}";
+    }}, 1200);
   </script>
 </body>
 </html>
 """
-        return Response(html, mimetype="text/html")
+    return html
 
-    except Exception as e:
-        # навіть якщо впало — покажемо сторінку з помилкою
-        html = f"""
-<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Помилка імпорту</title></head>
-<body style="font-family:system-ui;background:#0B121C;color:#fff;padding:20px">
-<h2>❌ Помилка імпорту</h2>
-<p>{str(e)}</p>
-<p><a style="color:#7fb0ff" href="{WEBAPP_URL}">Повернутись у Нагадайку</a></p>
-</body></html>
-"""
-        return Response(html, mimetype="text/html", status=500)
 
 
 # ===================================================
@@ -769,3 +757,4 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
