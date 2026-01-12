@@ -34,7 +34,6 @@ UA_TZ = ZoneInfo("Europe/Kyiv")
 BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
 BOT_USERNAME = "nahadayka_bot" 
 
-OPENAI_API_KEY = "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"
 
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
@@ -753,5 +752,6 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
