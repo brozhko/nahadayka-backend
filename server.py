@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import json
 import os
@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from flask_sqlalchemy import SQLAlchemy
 
-# OpenAI (ШІ)
+# OpenAI
 from openai import OpenAI
 
 # Google API
@@ -27,22 +27,25 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 UA_TZ = ZoneInfo("Europe/Kyiv")
 
+
 # ===================================================
-# CONFIG
+# CONFIG (тут лишаємо токени, як ти хочеш)
 # ===================================================
-# ⚠️ Встав свій токен сюди (як було)
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
+BOT_USERNAME = "nahadayka_bot" 
+
+OPENAI_API_KEY = "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"
 
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 
 CLIENT_SECRETS_FILE = "credentials.json"
-
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
 REDIRECT_URI = f"{BACKEND_URL}/api/google_callback"
+
 
 # ===================================================
 # DB (SQLite local, Postgres on Render via DATABASE_URL)
@@ -77,6 +80,9 @@ with app.app_context():
     db.create_all()
 
 
+# ===================================================
+# HELPERS: USERS + DEADLINES
+# ===================================================
 def _get_or_create_user(uid: str) -> User:
     uid = str(uid)
     user = User.query.filter_by(telegram_id=uid).first()
@@ -106,6 +112,42 @@ def _all_users_dict():
 
 
 # ===================================================
+# TELEGRAM SEND (надійно, з кнопкою web_app)
+# ===================================================
+def tg_send_message(chat_id: str, text: str):
+    if not BOT_TOKEN or BOT_TOKEN.startswith("PASTE_"):
+        return
+
+    kb = {
+        "inline_keyboard": [
+            [{"text": "📲 Відкрити Нагадайку", "web_app": {"url": WEBAPP_URL}}],
+        ]
+    }
+
+    # додатково: кнопка на бота (якщо вказаний username)
+    if BOT_USERNAME and (not BOT_USERNAME.startswith("PASTE_")):
+        kb["inline_keyboard"].append(
+            [{"text": "🤖 Відкрити бота", "url": f"https://t.me/{BOT_USERNAME}"}]
+        )
+
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "disable_web_page_preview": True,
+        "reply_markup": kb
+    }
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload,
+            timeout=15
+        )
+    except Exception as e:
+        print("TG send error:", e)
+
+
+# ===================================================
 # AI LIMITS + CACHE
 # ===================================================
 AI_LIMIT_PER_DAY = int(os.getenv("AI_LIMIT_PER_DAY", "5"))
@@ -123,8 +165,12 @@ def _load_json_file(path: str, default):
 
 
 def _save_json_file(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # на Render файлова система може бути нестабільна між деплоями — але це ок для кешу
+        pass
 
 
 def _today_key():
@@ -135,7 +181,7 @@ def _img_hash(img_bytes: bytes) -> str:
     return hashlib.sha256(img_bytes).hexdigest()
 
 
-def _can_use_ai(uid: str) -> tuple[bool, int]:
+def _can_use_ai(uid: str):
     usage = _load_json_file(AI_USAGE_FILE, {})
     today = _today_key()
 
@@ -183,8 +229,8 @@ def _filter_deadlines_by_confidence(payload: dict) -> dict:
 
 
 def get_ai_client():
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key:
+    key = (OPENAI_API_KEY or "").strip()
+    if not key or key.startswith("PASTE_"):
         return None
     return OpenAI(api_key=key)
 
@@ -219,7 +265,7 @@ def all_users():
 
 
 # ===================================================
-# DEADLINES API (формат НЕ міняємо)
+# DEADLINES API (НЕ міняємо формат)
 # ===================================================
 @app.post("/api/deadlines/<user_id>")
 def add_or_update_deadline(user_id):
@@ -278,7 +324,7 @@ def delete_deadline(user_id):
 
 
 # ===================================================
-# 🤖 AI SCAN IMAGE (FIX MIME + SIZE LIMIT)
+# 🤖 AI SCAN IMAGE (MIME FIX + SIZE LIMIT)
 # ===================================================
 @app.post("/api/scan_deadlines_ai")
 def scan_deadlines_ai():
@@ -292,7 +338,7 @@ def scan_deadlines_ai():
     if not img_bytes:
         return jsonify({"error": "empty_file"}), 400
 
-    # ✅ ліміт (щоб не падало на великих фотках)
+    # size limit
     MAX_MB = 8
     if len(img_bytes) > MAX_MB * 1024 * 1024:
         return jsonify({
@@ -300,7 +346,7 @@ def scan_deadlines_ai():
             "message": f"Фото завелике (> {MAX_MB}MB). Зроби інше або стисни."
         }), 413
 
-    # 1) CACHE
+    # CACHE
     img_key = _img_hash(img_bytes)
     cache = _load_json_file(AI_CACHE_FILE, {})
     if img_key in cache:
@@ -312,7 +358,7 @@ def scan_deadlines_ai():
             **filtered
         }), 200
 
-    # 2) LIMIT
+    # LIMIT
     allowed, remaining = _can_use_ai(uid)
     if not allowed:
         return jsonify({
@@ -322,17 +368,15 @@ def scan_deadlines_ai():
             "message": "Ліміт AI на сьогодні вичерпаний. Спробуй завтра або зменш кількість сканів."
         }), 429
 
-    # 3) KEY CHECK
     client = get_ai_client()
     if not client:
-        return jsonify({"error": "no_openai_key", "hint": "Set OPENAI_API_KEY in Render env"}), 500
+        return jsonify({"error": "no_openai_key"}), 500
 
-    # ✅ MIME FIX (це головний фікс для камери/телефону)
+    # MIME FIX
     mime = (file.mimetype or "").strip().lower()
     if not mime.startswith("image/"):
         mime = "image/jpeg"
 
-    # ⚠️ HEIC/HEIF інколи не підтримується. Якщо впаде — краще відловити одразу.
     if mime in ("image/heic", "image/heif"):
         return jsonify({
             "error": "unsupported_image",
@@ -384,14 +428,13 @@ def scan_deadlines_ai():
 
         payload = _openai_response_to_json(resp)
 
-        # 4) cache
+        # cache save
         cache[img_key] = payload
         _save_json_file(AI_CACHE_FILE, cache)
 
-        # 5) usage++
+        # usage++
         _inc_ai_usage(uid)
 
-        # 6) filter confidence
         filtered = _filter_deadlines_by_confidence(payload)
 
         return jsonify({
@@ -455,14 +498,14 @@ def google_login(user_id):
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
-        state=user_id
+        state=str(user_id)
     )
 
     return jsonify({"auth_url": auth_url})
 
 
 # ===================================================
-# GOOGLE CALLBACK
+# GOOGLE CALLBACK (гарна сторінка + авто-повернення)
 # ===================================================
 @app.get("/api/google_callback")
 def google_callback():
@@ -470,36 +513,126 @@ def google_callback():
     user_id = request.args.get("state")
 
     if not code or not user_id:
-        return "Missing code/state", 400
+        return Response("Missing code/state", status=400)
 
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-    )
-
-    flow.fetch_token(code=code)
-    creds = flow.credentials
-
-    with open(f"token_{user_id}.json", "w") as f:
-        f.write(creds.to_json())
-
-    imported_calendar = import_google_calendar(user_id, creds)
-    imported_gmail = import_gmail(user_id, creds)
-
-    msg = (
-        f"📅 Календар: імпортовано {imported_calendar} подій\n"
-        f"📧 Gmail: знайдено {imported_gmail} листів із завданнями"
-    )
-
-    if BOT_TOKEN:
-        requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            params={"chat_id": user_id, "text": msg},
-            timeout=15
+    try:
+        flow = Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE,
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI,
         )
 
-    return "Готово! Можеш закрити вкладку."
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+
+        # зберігаємо токен
+        with open(f"token_{user_id}.json", "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+
+        imported_calendar = import_google_calendar(user_id, creds)
+        imported_gmail = import_gmail(user_id, creds)
+
+        # шлемо в Telegram
+        msg = (
+            f"✅ Імпорт завершено!\n\n"
+            f"📅 Календар: імпортовано {imported_calendar} подій\n"
+            f"📧 Gmail: знайдено {imported_gmail} листів із завданнями\n\n"
+            f"Відкрий Нагадайку і онови список ✅"
+        )
+        tg_send_message(user_id, msg)
+
+        # гарна HTML-сторінка
+        open_webapp = WEBAPP_URL
+        open_bot = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME and (not BOT_USERNAME.startswith("PASTE_")) else "https://t.me"
+
+        html = f"""
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Імпорт завершено</title>
+  <meta name="theme-color" content="#0B121C">
+  <style>
+    body {{
+      margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background:#0B121C; color:#fff; display:flex; min-height:100vh; align-items:center; justify-content:center;
+    }}
+    .card {{
+      width:min(560px, 92vw);
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 18px;
+      padding: 18px 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }}
+    h1 {{ margin:0 0 6px; font-size: 20px; }}
+    .muted {{ color: rgba(255,255,255,0.75); font-size: 14px; margin-bottom: 14px; }}
+    .grid {{ display:grid; gap:10px; margin-top: 12px; }}
+    .btn {{
+      display:block; text-decoration:none; text-align:center;
+      padding: 12px 14px; border-radius: 14px; font-weight: 700;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08); color: #fff;
+    }}
+    .btn.primary {{
+      background: #2f7cff;
+      border-color: rgba(47,124,255,0.6);
+    }}
+    .stats {{
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      font-size: 14px;
+      line-height: 1.45;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>✅ Імпорт завершено</h1>
+    <div class="muted">Тепер повернись у Telegram і онови список дедлайнів.</div>
+
+    <div class="stats">
+      📅 Календар: <b>{imported_calendar}</b><br>
+      📧 Gmail: <b>{imported_gmail}</b>
+    </div>
+
+    <div class="grid">
+      <a class="btn primary" href="{open_webapp}">📲 Повернутись у Нагадайку</a>
+      <a class="btn" href="{open_bot}">🤖 Відкрити бота</a>
+    </div>
+
+    <div class="muted" style="margin-top:12px;">
+      Якщо не повернуло автоматом — натисни кнопку вище.
+    </div>
+  </div>
+
+  <script>
+    // авто-повернення (через 900мс)
+    setTimeout(() => {{
+      window.location.href = "{open_webapp}";
+    }}, 900);
+  </script>
+</body>
+</html>
+"""
+        return Response(html, mimetype="text/html")
+
+    except Exception as e:
+        # навіть якщо впало — покажемо сторінку з помилкою
+        html = f"""
+<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Помилка імпорту</title></head>
+<body style="font-family:system-ui;background:#0B121C;color:#fff;padding:20px">
+<h2>❌ Помилка імпорту</h2>
+<p>{str(e)}</p>
+<p><a style="color:#7fb0ff" href="{WEBAPP_URL}">Повернутись у Нагадайку</a></p>
+</body></html>
+"""
+        return Response(html, mimetype="text/html", status=500)
 
 
 # ===================================================
@@ -513,10 +646,11 @@ def google_sync(user_id):
 
     creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
-    return jsonify({
-        "calendar": import_google_calendar(user_id, creds),
-        "gmail": import_gmail(user_id, creds)
-    })
+    cal = import_google_calendar(user_id, creds)
+    gm = import_gmail(user_id, creds)
+    tg_send_message(user_id, f"🔄 Ручна синхронізація:\n📅 {cal}\n📧 {gm}")
+
+    return jsonify({"calendar": cal, "gmail": gm})
 
 
 # ===================================================
@@ -529,7 +663,6 @@ def import_google_calendar(user_id, creds):
         return 0
 
     now = datetime.utcnow().isoformat() + "Z"
-
     result = service.events().list(
         calendarId="primary",
         timeMin=now,
@@ -583,14 +716,9 @@ def import_gmail(user_id, creds):
         return 0
 
     query = f"from:{LPNU_DOMAIN}"
-
-    result = service.users().messages().list(
-        userId="me",
-        q=query,
-        maxResults=50
-    ).execute()
-
+    result = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
     messages = result.get("messages", [])
+
     user = _get_or_create_user(user_id)
 
     added = 0
@@ -603,13 +731,17 @@ def import_gmail(user_id, creds):
         if not date_header:
             continue
 
-        try:
-            date_obj = datetime.strptime(date_header[:25], "%a, %d %b %Y %H:%M:%S")
-            date_str = date_obj.strftime("%Y-%m-%d 23:59")
-        except Exception:
+        # фільтр ключових слів
+        if not any(k in subject.lower() for k in KEYWORDS):
             continue
 
-        if not any(k in subject.lower() for k in KEYWORDS):
+        # дата листа -> ставимо як дедлайн "сьогодні 23:59" (як у тебе)
+        try:
+            # date_header часто типу: "Mon, 06 Jan 2026 12:34:56 +0200"
+            base = date_header[:25]
+            date_obj = datetime.strptime(base, "%a, %d %b %Y %H:%M:%S")
+            date_str = date_obj.strftime("%Y-%m-%d 23:59")
+        except Exception:
             continue
 
         exists = Deadline.query.filter_by(user_id=user.id, title=subject, date=date_str).first()
