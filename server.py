@@ -32,14 +32,13 @@ UA_TZ = ZoneInfo("Europe/Kyiv")
 # CONFIG
 # ===================================================
 # ✅ BOT TOKEN лишається в коді (як ти хотів)
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
 BOT_USERNAME = os.getenv("BOT_USERNAME", "nahadayka_bot").strip()
 
-# ✅ Render ENV (можна теж лишити як є, але краще щоб можна було змінювати без коду)
+
 BACKEND_URL = os.getenv("BACKEND_URL", "https://nahadayka-backend.onrender.com").strip()
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://brozhko.github.io/nahadayka-bot_v1/").strip()
 
-# ✅ OpenAI key з Render
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 CLIENT_SECRETS_FILE = "credentials.json"
@@ -788,3 +787,4 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
