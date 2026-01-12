@@ -8,6 +8,8 @@ from datetime import datetime
 import requests
 from zoneinfo import ZoneInfo
 
+from flask_sqlalchemy import SQLAlchemy
+
 # OpenAI (ШІ)
 from openai import OpenAI
 
@@ -34,7 +36,6 @@ BOT_TOKEN = "8593319031:AAF5UQTx7g8hKMgkQxXphGM5nsi-GQ_hOZg"
 BACKEND_URL = "https://nahadayka-backend.onrender.com"
 WEBAPP_URL = "https://brozhko.github.io/nahadayka-bot_v1/"
 
-DATA_FILE = "deadlines.json"
 CLIENT_SECRETS_FILE = "credentials.json"
 
 SCOPES = [
@@ -42,6 +43,70 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
 REDIRECT_URI = f"{BACKEND_URL}/api/google_callback"
+
+
+# ===================================================
+# DB (SQLite local, Postgres on Render via DATABASE_URL)
+# ===================================================
+db_url = os.environ.get("DATABASE_URL", "").strip()
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+# Якщо на Render задано DATABASE_URL -> Postgres.
+# Якщо ні -> локально SQLite файл.
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url or "sqlite:///db.sqlite3"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+
+class User(db.Model):
+    __tablename__ = "users"
+    id = db.Column(db.Integer, primary_key=True)
+    telegram_id = db.Column(db.String(64), unique=True, nullable=False, index=True)
+
+
+class Deadline(db.Model):
+    __tablename__ = "deadlines"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+
+    # ВАЖЛИВО: поле називається date, бо твої фічі/бот так очікують
+    title = db.Column(db.String(255), nullable=False)
+    date = db.Column(db.String(32), nullable=False)  # "YYYY-MM-DD HH:MM"
+    last_notified = db.Column(db.Integer, nullable=True)
+
+
+with app.app_context():
+    db.create_all()
+
+
+def _get_or_create_user(uid: str) -> User:
+    uid = str(uid)
+    user = User.query.filter_by(telegram_id=uid).first()
+    if not user:
+        user = User(telegram_id=uid)
+        db.session.add(user)
+        db.session.commit()
+    return user
+
+
+def _list_deadlines(uid: str):
+    uid = str(uid)
+    user = User.query.filter_by(telegram_id=uid).first()
+    if not user:
+        return []
+    rows = Deadline.query.filter_by(user_id=user.id).order_by(Deadline.id.asc()).all()
+    return [{"title": r.title, "date": r.date, "last_notified": r.last_notified} for r in rows]
+
+
+def _all_users_dict():
+    out = {}
+    users = User.query.all()
+    for u in users:
+        rows = Deadline.query.filter_by(user_id=u.id).order_by(Deadline.id.asc()).all()
+        out[u.telegram_id] = [{"title": r.title, "date": r.date, "last_notified": r.last_notified} for r in rows]
+    return out
 
 
 # ===================================================
@@ -155,71 +220,54 @@ def _openai_response_to_json(resp) -> dict:
 
 
 # ===================================================
-# STORAGE
-# ===================================================
-def load_deadlines():
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_deadlines(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-# ===================================================
 # API: RETURN ALL USERS (FOR CRON)
 # ===================================================
 @app.get("/api/all")
 def all_users():
-    return jsonify(load_deadlines())
+    return jsonify(_all_users_dict())
 
 
 # ===================================================
-# DEADLINES API
+# DEADLINES API (НЕ ЛАМАЄМО ФОРМАТ)
 # ===================================================
 @app.post("/api/deadlines/<user_id>")
 def add_or_update_deadline(user_id):
     body = request.get_json() or {}
-    data = load_deadlines()
-    data.setdefault(user_id, [])
+    user = _get_or_create_user(user_id)
 
-    # update last_notified
+    # ✅ update last_notified (як було)
     if "last_notified_update" in body and "title" in body:
         title = str(body.get("title", "")).strip()
         new_val = body.get("last_notified_update")
 
-        for d in data[user_id]:
-            if d.get("title") == title:
-                d["last_notified"] = new_val
-                save_deadlines(data)
-                return jsonify({"updated": True})
+        row = Deadline.query.filter_by(user_id=user.id, title=title).first()
+        if not row:
+            return jsonify({"error": "not found"}), 404
 
-        return jsonify({"error": "not found"}), 404
+        row.last_notified = new_val
+        db.session.commit()
+        return jsonify({"updated": True})
 
+    # ✅ add deadline (як було: title + date)
     title = str(body.get("title", "")).strip()
     date = str(body.get("date", "")).strip()
 
     if not title or not date:
         return jsonify({"error": "title and date required"}), 400
 
-    data[user_id].append({
-        "title": title,
-        "date": date,
-        "last_notified": None
-    })
+    # (опційно) не дублюємо точні співпадіння
+    exists = Deadline.query.filter_by(user_id=user.id, title=title, date=date).first()
+    if exists:
+        return jsonify({"status": "exists"}), 200
 
-    save_deadlines(data)
+    db.session.add(Deadline(user_id=user.id, title=title, date=date, last_notified=None))
+    db.session.commit()
     return jsonify({"status": "added"}), 201
 
 
 @app.get("/api/deadlines/<user_id>")
 def get_deadlines(user_id):
-    data = load_deadlines()
-    return jsonify(data.get(user_id, []))
+    return jsonify(_list_deadlines(user_id))
 
 
 @app.delete("/api/deadlines/<user_id>")
@@ -227,10 +275,15 @@ def delete_deadline(user_id):
     body = request.get_json() or {}
     title = str(body.get("title", "")).strip()
 
-    data = load_deadlines()
-    if user_id in data and title:
-        data[user_id] = [d for d in data[user_id] if d.get("title") != title]
-        save_deadlines(data)
+    if not title:
+        return jsonify({"status": "ok"})
+
+    user = User.query.filter_by(telegram_id=str(user_id)).first()
+    if not user:
+        return jsonify({"status": "ok"})
+
+    Deadline.query.filter_by(user_id=user.id, title=title).delete()
+    db.session.commit()
 
     return jsonify({"status": "ok"})
 
@@ -320,7 +373,6 @@ def scan_deadlines_ai():
             text={"format": {"type": "json_object"}},
         )
 
-        # ✅ FIX для openai==2.x: парсимо JSON з output_text
         payload = _openai_response_to_json(resp)
 
         # 4) save cache (сирий результат)
@@ -345,7 +397,7 @@ def scan_deadlines_ai():
 
 
 # ===================================================
-# ✅ ADD AI SCANNED -> save to deadlines.json
+# ✅ ADD AI SCANNED -> save to DB (НЕ ЛАМАЄМО ФІЧУ)
 # ===================================================
 @app.post("/api/add_ai_scanned/<user_id>")
 def add_ai_scanned(user_id):
@@ -355,8 +407,7 @@ def add_ai_scanned(user_id):
     if not isinstance(deadlines, list) or not deadlines:
         return jsonify({"error": "deadlines required", "added": 0}), 400
 
-    data = load_deadlines()
-    data.setdefault(user_id, [])
+    user = _get_or_create_user(user_id)
 
     added = 0
     for d in deadlines:
@@ -369,18 +420,14 @@ def add_ai_scanned(user_id):
 
         date_value = f"{due_date} {due_time}"
 
-        exists = any(x.get("title") == title and x.get("date") == date_value for x in data[user_id])
+        exists = Deadline.query.filter_by(user_id=user.id, title=title, date=date_value).first()
         if exists:
             continue
 
-        data[user_id].append({
-            "title": title,
-            "date": date_value,
-            "last_notified": None
-        })
+        db.session.add(Deadline(user_id=user.id, title=title, date=date_value, last_notified=None))
         added += 1
 
-    save_deadlines(data)
+    db.session.commit()
     return jsonify({"status": "ok", "added": added}), 200
 
 
@@ -464,7 +511,7 @@ def google_sync(user_id):
 
 
 # ===================================================
-# IMPORT EVENTS FROM CALENDAR
+# IMPORT EVENTS FROM CALENDAR (в DB)
 # ===================================================
 def import_google_calendar(user_id, creds):
     try:
@@ -484,8 +531,7 @@ def import_google_calendar(user_id, creds):
 
     events = result.get("items", [])
 
-    data = load_deadlines()
-    user_items = data.setdefault(user_id, [])
+    user = _get_or_create_user(user_id)
 
     imported = 0
     for ev in events:
@@ -504,22 +550,19 @@ def import_google_calendar(user_id, creds):
         if not date_value:
             continue
 
-        if any(d.get("title") == title and d.get("date") == date_value for d in user_items):
+        exists = Deadline.query.filter_by(user_id=user.id, title=title, date=date_value).first()
+        if exists:
             continue
 
-        user_items.append({
-            "title": title,
-            "date": date_value,
-            "last_notified": None
-        })
+        db.session.add(Deadline(user_id=user.id, title=title, date=date_value, last_notified=None))
         imported += 1
 
-    save_deadlines(data)
+    db.session.commit()
     return imported
 
 
 # ===================================================
-# 📧 IMPORT FROM GMAIL (LPNU + KEYWORDS)
+# 📧 IMPORT FROM GMAIL (LPNU + KEYWORDS) (в DB)
 # ===================================================
 KEYWORDS = [k.lower() for k in ["лаба", "лаб", "завдання", "звіт", "робота", "кр", "практична"]]
 LPNU_DOMAIN = "@lpnu.ua"
@@ -541,8 +584,7 @@ def import_gmail(user_id, creds):
 
     messages = result.get("messages", [])
 
-    data = load_deadlines()
-    user_items = data.setdefault(user_id, [])
+    user = _get_or_create_user(user_id)
 
     added = 0
     for msg in messages:
@@ -563,15 +605,14 @@ def import_gmail(user_id, creds):
         if not any(k in subject.lower() for k in KEYWORDS):
             continue
 
-        if not any(d.get("title") == subject and d.get("date") == date_str for d in user_items):
-            user_items.append({
-                "title": subject,
-                "date": date_str,
-                "last_notified": None
-            })
-            added += 1
+        exists = Deadline.query.filter_by(user_id=user.id, title=subject, date=date_str).first()
+        if exists:
+            continue
 
-    save_deadlines(data)
+        db.session.add(Deadline(user_id=user.id, title=subject, date=date_str, last_notified=None))
+        added += 1
+
+    db.session.commit()
     return added
 
 
