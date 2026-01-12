@@ -534,7 +534,7 @@ def google_callback():
     except Exception as e:
         return f"<h3>Token save error</h3><pre>{str(e)}</pre>", 500
 
-    # імпорт
+    # імпорт (рахуємо, але НЕ показуємо на сайті)
     imported_calendar = 0
     imported_gmail = 0
     try:
@@ -547,7 +547,7 @@ def google_callback():
     except Exception:
         imported_gmail = 0
 
-    # повідомлення в Telegram
+    # ✅ повідомлення в Telegram чаті (ОСЬ ТУТ БУДЕ ПИСАТИ)
     msg = (
         f"✅ Google підключено!\n"
         f"📅 Календар: імпортовано {imported_calendar} подій\n"
@@ -564,17 +564,17 @@ def google_callback():
         except Exception:
             pass
 
-    # ✅ Лінк назад у Telegram (відкриє чат з ботом)
+    # ✅ повернення в Telegram (чат з ботом)
     tg_link = f"https://t.me/{BOT_USERNAME}?start=google_done"
 
-    # ✅ Гарна сторінка + авто-повернення
+    # ✅ на сайті: НІЯКИХ цифр/тексту про імпорт
     html = f"""
 <!doctype html>
 <html lang="uk">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Нагадайка — Google підключено</title>
+  <title>Готово</title>
   <style>
     body {{
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
@@ -588,7 +588,7 @@ def google_callback():
       box-shadow: 0 10px 30px rgba(0,0,0,.35);
     }}
     h1 {{ font-size: 20px; margin: 0 0 10px; }}
-    .meta {{ opacity: .9; line-height: 1.5; }}
+    .meta {{ opacity: .85; line-height: 1.5; }}
     .btn {{
       display: inline-block; margin-top: 16px;
       background: #2B6CFF; color: white; text-decoration: none;
@@ -600,21 +600,17 @@ def google_callback():
 </head>
 <body>
   <div class="card">
-    <h1>✅ Google підключено</h1>
-    <div class="meta">
-      📅 Календар: <b>{imported_calendar}</b> подій<br/>
-      📧 Gmail: <b>{imported_gmail}</b> листів
-    </div>
+    <h1>✅ Готово</h1>
+    <div class="meta">Можеш повернутись у Telegram.</div>
 
     <a class="btn" href="{tg_link}">Повернутись в Telegram</a>
     <div class="small">Якщо не перекинуло автоматично — натисни кнопку.</div>
   </div>
 
   <script>
-    // авто-повернення через 1.2с
     setTimeout(function() {{
       window.location.href = "{tg_link}";
-    }}, 1200);
+    }}, 900);
   </script>
 </body>
 </html>
@@ -757,4 +753,5 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
 
